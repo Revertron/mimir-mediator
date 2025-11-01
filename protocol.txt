@@ -1,0 +1,123 @@
+  Protocol Commands
+
+  Authentication Commands
+
+  - cmdGetNonce (0x01): Request authentication nonce
+    - Input: pubkey(32)
+    - Output: nonce(32)
+  - cmdAuth (0x02): Authenticate connection
+    - Input: pubkey(32) + nonce(32) + signature(64)
+    - Output: Success/Error
+
+  Chat Management Commands
+
+  - cmdCreateChat (0x10): Create new chat room
+    - Input: owner_pubkey(32) + nonce(32) + key(32) + signature(64) + name(str) + description(str) + avatar(blob)
+    - Output: chat_id(u64)
+    - Requires: Authentication
+  - cmdDeleteChat (0x11): Delete chat room (owner only)
+    - Input: chat_id(u64)
+    - Output: Success byte
+    - Requires: Authentication, Owner permission
+
+  User Management Commands
+
+  - cmdAddUser (0x20): Add/invite user to chat
+    - Input: chat_id(u64) + user_pubkey(32)
+    - Output: Success
+    - Requires: Authentication, Owner/Admin/Mod permission
+  - cmdDeleteUser (0x21): Ban user from chat
+    - Input: chat_id(u64) + user_pubkey(32)
+    - Output: Success
+    - Requires: Authentication, Owner/Admin/Mod permission
+  - cmdLeaveChat (0x22): Leave chat room
+    - Input: chat_id(u64)
+    - Output: Success
+    - Requires: Authentication, Cannot be owner
+  - cmdGetUserChats (0x23): Get list of user's chats
+    - Input: None
+    - Output: count(u32) + [chat_id(u64)...]
+    - Requires: Authentication
+
+  Message Commands
+
+  - cmdSendMessage (0x30): Send message to chat
+    - Input: chat_id(u64) + guid(u64) + blob
+    - Output: message_id(u64)
+    - Requires: Authentication, Not banned, Not read-only
+  - cmdDeleteMessage (0x31): Delete message (moderator action)
+    - Input: chat_id(u64) + message_id(u64)
+    - Output: Success
+    - Requires: Authentication, Owner/Admin/Mod permission
+  - cmdGetMessage (0x32): Retrieve message by ID
+    - Input: chat_id(u64) + message_id(u64)
+    - Output: message_id(u64) + guid(u64) + blob
+    - Requires: Authentication, Chat membership
+    - Note: Messages expire after 24 hours (cache TTL)
+  - cmdGetLastMessageID (0x33): Get last message ID in chat
+    - Input: chat_id(u64)
+    - Output: last_id(u64)
+    - Requires: Authentication, Chat membership
+  - cmdGotMessage (0x34): Server → Client notification (live message)
+    - Payload: chat_id(u64) + message_id(u64) + guid(u64) + blob
+    - Broadcast to subscribed users
+  - cmdSubscribe (0x35): Subscribe to live messages
+    - Input: chat_id(u64)
+    - Output: Success
+    - Requires: Authentication, Not banned, Not read-only
+
+  Invite Commands
+
+  - cmdSendInvite (0x40): Send invite to user
+    - Input: to_pubkey(32) + chat_id(u64) + encrypted_data(blob)
+    - Output: Success
+    - Requires: Authentication, Owner/Admin/Mod permission
+  - cmdGotInvite (0x41): Server → Client notification (invite delivery)
+    - Payload: timestamp(8) + from_pubkey(32) + chat_id(8) + chat_name(str) + chat_desc(str) + chat_avatar(blob) + encrypted_data(blob)
+    - Delivered asynchronously by mediator
+
+  Permission Bits
+
+  - 0x80 - Owner: Chat creator, full control
+  - 0x40 - Admin: Administrative privileges
+  - 0x20 - Moderator: Can moderate users/messages
+  - 0x10 - User: Regular participant
+  - 0x08 - Read-only: Cannot post messages
+  - 0x01 - Banned: Explicitly blocked
+
+  Database Tables
+
+  Global Tables
+
+  - nonces: Authentication nonces
+  - chats: Chat registry
+  - invites: Pending invitations (auto-cleanup after 3 days)
+
+  Per-Chat Tables
+
+  - settings-{id}: Chat metadata (name, description, avatar, perms_flags)
+  - users-{id}: Members and roles (pubkey, nickname, perms_flags, banned)
+  - messages-{id}: Message metadata (id, ts, guid, author)
+
+  Background Services
+
+  - 3x Invite Delivery Workers: Concurrent invite delivery with retry logic
+  - Invite Cleanup Worker: Runs every 5 minutes to:
+    - Delete invites older than 3 days
+    - Retry pending invites
+  - HybridCache: RAM (Ristretto) + Disk (Badger) caching for message blobs
+
+  Wire Protocol Format
+
+  Request Frame:
+  [version:1=0x01][cmd:1][reqId:2][len:4][payload:len]
+
+  Response Frame:
+  [status:1 (0=OK,1=ERR)][reqId:2][len:4][payload:len]
+
+  Data Types:
+  - u64/u32/u16: Big-endian integers
+  - string: [u16 len][bytes]
+  - blob: [u32 len][bytes]
+  - pubkey: 32 bytes (Ed25519)
+  - signature: 64 bytes (Ed25519)
