@@ -15,6 +15,8 @@ type HybridCache struct {
 func NewHybridCache(dbPath string, memSizeBytes int64) (*HybridCache, error) {
 	opts := badger.DefaultOptions(dbPath)
 	opts.Logger = nil
+	opts.ValueLogFileSize = 256 << 20
+	opts.BaseTableSize = 16 << 20
 	db, err := badger.Open(opts)
 	if err != nil {
 		return nil, err

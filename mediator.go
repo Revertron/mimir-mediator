@@ -16,8 +16,6 @@ import (
 	"math"
 	"math/big"
 	"mediator/hybridcache"
-	"net"
-
 	//"net"
 	"os"
 	"os/signal"
@@ -83,7 +81,7 @@ Extra schema:
 - global table "nonces(pubkey BLOB(32), nonce TEXT, ts INTEGER, PRIMARY KEY(pubkey))"
 - global table "chats(id INTEGER PRIMARY KEY, owner_pubkey BLOB(32), created_at INTEGER NOT NULL)"
 - settings-{id}(name, description, avatar, perms_flags, created_at, extra JSON)
-- users-{id}(pubkey, nickname, text_rank, perms_flags, accepted_at, last_perm_change, banned)
+    - users-{id}(pubkey, nickname, text_rank, perms_flags, accepted_at, changed_at, banned)
 - messages-{id}(id INTEGER PK AUTOINCREMENT, ts, blob, author)
 
 Signature rules:
@@ -99,23 +97,29 @@ const (
 	protoClient = 0x00
 
 	// commands
-	cmdGetNonce         = 0x01
-	cmdAuth             = 0x02
-	cmdPing             = 0x03
-	cmdCreateChat       = 0x10
-	cmdDeleteChat       = 0x11
-	cmdAddUser          = 0x20
-	cmdDeleteUser       = 0x21
-	cmdLeaveChat        = 0x22
-	cmdGetUserChats     = 0x23
-	cmdSendMessage      = 0x30
-	cmdDeleteMessage    = 0x31
-	cmdGetMessage       = 0x32
-	cmdGetLastMessageID = 0x33
-	cmdGotMessage       = 0x34 // Server sends it to the client after receiving a message from some user.
-	cmdSubscribe        = 0x35
-	cmdSendInvite       = 0x40
-	cmdGotInvite        = 0x41 // Server sends it to the client when delivering an invite.
+	cmdGetNonce          = 0x01
+	cmdAuth              = 0x02
+	cmdPing              = 0x03
+	cmdCreateChat        = 0x10
+	cmdDeleteChat        = 0x11
+	cmdAddUser           = 0x20
+	cmdDeleteUser        = 0x21
+	cmdLeaveChat         = 0x22
+	cmdGetUserChats      = 0x23
+	cmdSendMessage       = 0x30
+	cmdDeleteMessage     = 0x31
+	cmdGetMessage        = 0x32
+	cmdGetLastMessageID  = 0x33
+	cmdGotMessage        = 0x34 // Server sends it to the client after receiving a message from some user.
+	cmdSubscribe         = 0x35
+	cmdSendInvite        = 0x40
+	cmdGotInvite         = 0x41 // Server sends it to the client when delivering an invite.
+	cmdInviteResponse    = 0x42 // Client responds to invite (accept/reject)
+	cmdUpdateMemberInfo  = 0x50 // Client sends encrypted member info (nickname, info, avatar)
+	cmdRequestMemberInfo = 0x51 // Server requests member info from client
+	cmdGetMembersInfo    = 0x52 // Client requests all members info
+	cmdGetMembers        = 0x53 // Client requests all member pubkeys (lightweight)
+	cmdGotMemberInfo     = 0x54 // Server push: member info updated
 
 	// response status
 	statusOK  = 0x00
@@ -148,10 +152,9 @@ type serverState struct {
 	chatMu            sync.RWMutex
 	chatSubscriptions map[uint64]map[*clientConn]struct{}
 	cache             *hybridcache.HybridCache
-	// invite delivery tracking
-	inviteDialMu  sync.Mutex
-	inviteDialers map[[32]byte]struct{} // pubkeys currently being dialed
-	inviteQueue   chan [32]byte         // queue of pubkeys to dial for invite delivery
+	// authenticated clients tracking: pubkey → client connection
+	authClientsMu        sync.RWMutex
+	authenticatedClients map[[32]byte]*clientConn
 }
 
 // connection-scoped state
@@ -215,6 +218,8 @@ func main() {
 	if err := initGlobalSchema(db); err != nil {
 		log.Fatal(err)
 	}
+	// Migrate per-chat users tables to use changed_at instead of last_perm_change
+	migrateUsersChangedAt(db)
 
 	cache, err := hybridcache.NewHybridCache("mediator-cache", 512*1024*1024) // 512 MB RAM/disk hybrid
 	if err != nil {
@@ -223,15 +228,14 @@ func main() {
 	defer cache.Close()
 
 	st := &serverState{
-		db:                db,
-		node:              node,
-		transport:         m.GetTransport(),
-		priv:              priv,
-		pub:               pub,
-		chatSubscriptions: make(map[uint64]map[*clientConn]struct{}),
-		cache:             cache,
-		inviteDialers:     make(map[[32]byte]struct{}),
-		inviteQueue:       make(chan [32]byte, 100),
+		db:                   db,
+		node:                 node,
+		transport:            m.GetTransport(),
+		priv:                 priv,
+		pub:                  pub,
+		chatSubscriptions:    make(map[uint64]map[*clientConn]struct{}),
+		cache:                cache,
+		authenticatedClients: make(map[[32]byte]*clientConn),
 	}
 
 	log.Printf("mediator started; pubkey: %x", pub[:])
@@ -240,12 +244,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start invite delivery workers
-	for i := 0; i < 3; i++ { // 3 concurrent workers
-		go st.inviteDeliveryWorker(ctx)
-	}
-
-	// Start periodic invite cleanup and retry
+	// Start periodic invite cleanup
 	go st.inviteCleanupWorker(ctx)
 
 	// Ctrl+C
@@ -356,6 +355,14 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 			cc.handleGetLastMessageID(reqId, payload)
 		case cmdSendInvite:
 			cc.handleSendInvite(reqId, payload)
+		case cmdInviteResponse:
+			cc.handleInviteResponse(reqId, payload)
+		case cmdUpdateMemberInfo:
+			cc.handleUpdateMemberInfo(reqId, payload)
+		case cmdGetMembersInfo:
+			cc.handleGetMembersInfo(reqId, payload)
+		case cmdGetMembers:
+			cc.handleGetMembers(reqId, payload)
 		default:
 			_ = cc.writeErr(0, "unknown cmd")
 			return
@@ -413,10 +420,41 @@ CREATE TABLE IF NOT EXISTS invites(
   to_pubkey      BLOB(32) NOT NULL,
   chat_id        INTEGER NOT NULL,
   encrypted_data BLOB NOT NULL,
+  sent           INTEGER NOT NULL DEFAULT 0,
   UNIQUE(to_pubkey, chat_id)
 );
 `)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Best-effort migration for existing databases missing the 'sent' column
+	// Ignore error if column already exists.
+	_, _ = db.Exec(`ALTER TABLE invites ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`)
+	return nil
+}
+
+// migrateUsersChangedAt best-effort migration: rename last_perm_change -> changed_at
+func migrateUsersChangedAt(db *sql.DB) {
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'users-%'`)
+	if err != nil {
+		log.Printf("migration: list users tables failed: %v", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		// Try to rename column; ignore errors (already migrated or old SQLite)
+		q := fmt.Sprintf(`ALTER TABLE %q RENAME COLUMN last_perm_change TO changed_at`, name)
+		if _, err := db.Exec(q); err != nil {
+			// Try creating column if rename failed and changed_at missing
+			// This is a noop if column already exists or rename succeeded
+			_, _ = db.Exec(fmt.Sprintf(`ALTER TABLE %q ADD COLUMN changed_at INTEGER NOT NULL DEFAULT 0`, name))
+		}
+	}
 }
 
 func chatTableNames(id uint64) (settings, users, messages string) {
@@ -439,12 +477,12 @@ CREATE TABLE %q(
 );
 CREATE TABLE %q(
   pubkey BLOB(32) PRIMARY KEY,
-  nickname TEXT,
   text_rank TEXT,
   perms_flags INTEGER NOT NULL,
   accepted_at INTEGER NOT NULL,
-  last_perm_change INTEGER NOT NULL,
-  banned INTEGER NOT NULL DEFAULT 0
+  changed_at INTEGER NOT NULL,
+  banned INTEGER NOT NULL DEFAULT 0,
+  info BLOB
 );
 CREATE TABLE %q(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -625,7 +663,17 @@ func (cc *clientConn) handleAuth(reqID uint16, p []byte) {
 
 	cc.authed = true
 	cc.pub = pk
+
+	// Register this client as authenticated
+	cc.s.authClientsMu.Lock()
+	cc.s.authenticatedClients[pk] = cc
+	cc.s.authClientsMu.Unlock()
+
+	// Send OK response first
 	_ = cc.writeOK(reqID, nil)
+
+	// Check for and send any pending invites after successful authentication
+	go cc.s.sendPendingInvites(cc)
 }
 
 func (cc *clientConn) handlePing(reqID uint16) {
@@ -760,9 +808,9 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 	}
 
 	// insert owner in users with owner bit; not banned
-	if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, nickname, text_rank, perms_flags, accepted_at, last_perm_change, banned)
-		VALUES(?,?,?,?,?,?,0)`, users),
-		owner[:], "", "", permOwner|permUser, now, now); err != nil {
+	if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info)
+        VALUES(?,?,?,?,?,0,?)`, users),
+		owner[:], "", permOwner|permUser, now, now, nil); err != nil {
 		_ = cc.writeErr(reqID, "db owner")
 		return
 	}
@@ -879,10 +927,10 @@ func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	now := time.Now().Unix()
 
-	_, err = cc.s.db.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, nickname, text_rank, perms_flags, accepted_at, last_perm_change, banned)
-		VALUES(?,?,?,?,?,?,0)
-		ON CONFLICT(pubkey) DO UPDATE SET banned=0, perms_flags=excluded.perms_flags`, usersTbl),
-		newUser, "", "", permUser, now, now)
+	_, err = cc.s.db.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info)
+        VALUES(?,?,?,?,?,0,?)
+        ON CONFLICT(pubkey) DO UPDATE SET banned=0, perms_flags=excluded.perms_flags`, usersTbl),
+		newUser, "", permUser, now, now, nil)
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
 		return
@@ -921,7 +969,7 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	now := time.Now().Unix()
-	_, err = cc.s.db.Exec(fmt.Sprintf(`UPDATE %q SET banned=1, perms_flags=(perms_flags | ?), last_perm_change=? WHERE pubkey=?`, usersTbl),
+	_, err = cc.s.db.Exec(fmt.Sprintf(`UPDATE %q SET banned=1, perms_flags=(perms_flags | ?), changed_at=? WHERE pubkey=?`, usersTbl),
 		permBanned, now, userPK)
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
@@ -1055,6 +1103,9 @@ func (cc *clientConn) handleSubscribe(reqID uint16, p []byte) {
 	}
 	cc.s.subscribe(chatID, cc)
 	_ = cc.writeOK(reqID, nil)
+
+	// Request member info update from client
+	go cc.requestMemberInfo(chatID)
 }
 
 func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
@@ -1102,7 +1153,8 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 		return
 	}
 
-	// Store blob in hybrid cache for short-term retention
+	// Store (author||blob) in hybrid cache for short-term retention
+	// Layout: [author(32)][blob]
 	key := fmt.Sprintf("%016x:%016x", chatID, guid)
 	if err := cc.s.cache.Set(key, blob, 24*time.Hour); err != nil {
 		log.Printf("cache set failed: %v", err)
@@ -1110,12 +1162,20 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 
 	id, _ := res.LastInsertId()
 	// After message successfully inserted:
-	out := make([]byte, 8+8+8+4+len(blob))
-	binary.BigEndian.PutUint64(out[0:8], chatID)
-	binary.BigEndian.PutUint64(out[8:16], uint64(id))
-	binary.BigEndian.PutUint64(out[16:24], guid)
-	binary.BigEndian.PutUint32(out[24:28], uint32(len(blob)))
-	copy(out[28:], blob)
+	// Broadcast payload: [chat_id(u64)][msg_id(u64)][guid(u64)][author(32)][blob_len(u32)][blob]
+	out := make([]byte, 8+8+8+32+4+len(blob))
+	off2 := 0
+	binary.BigEndian.PutUint64(out[off2:off2+8], chatID)
+	off2 += 8
+	binary.BigEndian.PutUint64(out[off2:off2+8], uint64(id))
+	off2 += 8
+	binary.BigEndian.PutUint64(out[off2:off2+8], guid)
+	off2 += 8
+	copy(out[off2:off2+32], cc.pub[:])
+	off2 += 32
+	binary.BigEndian.PutUint32(out[off2:off2+4], uint32(len(blob)))
+	off2 += 4
+	copy(out[off2:], blob)
 
 	// notify others
 	cc.s.broadcastMessage(chatID, cc, out)
@@ -1202,12 +1262,13 @@ func (cc *clientConn) handleGetMessage(reqID uint16, p []byte) {
 		return
 	}
 
-	// response: [message_id(u64)][blob]
-	out := make([]byte, 8+4+8+len(blob))
+	// response: [message_id(u64)][guid(u64)][pubkey(32)][blob_len(u32)][blob]
+	out := make([]byte, 8+4+8+32+4+len(blob))
 	binary.BigEndian.PutUint64(out[0:8], uint64(id))
 	binary.BigEndian.PutUint64(out[8:16], guid)
-	binary.BigEndian.PutUint32(out[16:20], uint32(len(blob)))
-	copy(out[20:], blob)
+	copy(out[16:], author)
+	binary.BigEndian.PutUint32(out[48:52], uint32(len(blob)))
+	copy(out[52:], blob)
 	_ = cc.writeOK(reqID, out)
 }
 
@@ -1291,24 +1352,367 @@ func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
 
 	// Insert invite into database
 	now := time.Now().Unix()
-	_, err = cc.s.db.Exec(`INSERT INTO invites(timestamp, from_pubkey, to_pubkey, chat_id, encrypted_data) VALUES(?,?,?,?,?)`,
+	result, err := cc.s.db.Exec(`INSERT INTO invites(timestamp, from_pubkey, to_pubkey, chat_id, encrypted_data) VALUES(?,?,?,?,?)`,
 		now, cc.pub[:], toPubkey, chatID, encryptedData)
 	if err != nil {
 		_ = cc.writeErr(reqID, "db insert error")
 		return
 	}
 
-	// Queue invite for delivery
+	inviteID, _ := result.LastInsertId()
+	log.Printf("Invite created: from %x… to %x… for chat %d (id=%d)", cc.pub[:4], toPubkey[:4], chatID, inviteID)
+
+	// Check if recipient is currently connected and authenticated
 	var toPubArr [32]byte
 	copy(toPubArr[:], toPubkey)
-	select {
-	case cc.s.inviteQueue <- toPubArr:
-		log.Printf("Invite created and queued: from %x… to %x… for chat %d", cc.pub[:4], toPubkey[:4], chatID)
-	default:
-		log.Printf("Invite queue full, invite stored but not queued: from %x… to %x…", cc.pub[:4], toPubkey[:4])
+
+	cc.s.authClientsMu.RLock()
+	recipientConn, isConnected := cc.s.authenticatedClients[toPubArr]
+	cc.s.authClientsMu.RUnlock()
+
+	if isConnected {
+		// Recipient is connected, send invite immediately
+		log.Printf("Recipient %x is connected, sending invite immediately", toPubArr[:4])
+		go cc.s.sendInviteToClient(recipientConn, inviteID, now, cc.pub[:], chatID, encryptedData)
+	} else {
+		log.Printf("Recipient %x not connected, invite stored for later delivery", toPubArr[:4])
 	}
 
 	_ = cc.writeOK(reqID, nil)
+}
+
+func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
+	// payload: invite_id(u64), accepted(u8)
+	// accepted: 0 = reject, 1 = accept
+	off := 0
+	if !cc.authed {
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+
+	inviteID, err := rdU64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad invite id")
+		return
+	}
+	if off+1 > len(p) {
+		_ = cc.writeErr(reqID, "bad accepted flag")
+		return
+	}
+	accepted := p[off]
+	off += 1
+
+	if accepted != 0 && accepted != 1 {
+		_ = cc.writeErr(reqID, "invalid accepted value")
+		return
+	}
+
+	// Look up the invite
+	var chatID uint64
+	var fromPubkey []byte
+	var toPubkey []byte
+	err = cc.s.db.QueryRow(`SELECT chat_id, from_pubkey, to_pubkey FROM invites WHERE id=?`, inviteID).
+		Scan(&chatID, &fromPubkey, &toPubkey)
+	if err != nil {
+		log.Printf("Invite %d not found: %v", inviteID, err)
+		_ = cc.writeErr(reqID, "invite not found")
+		return
+	}
+
+	// Verify that the responder is the intended recipient
+	var toPubArr [32]byte
+	copy(toPubArr[:], toPubkey)
+	if !equalBytes(cc.pub[:], toPubArr[:]) {
+		_ = cc.writeErr(reqID, "not recipient of this invite")
+		return
+	}
+
+	if accepted == 1 {
+		// User accepted: add to members table and request info
+		log.Printf("Invite %d accepted by %x for chat %d", inviteID, cc.pub[:4], chatID)
+
+		usersTbl := fmt.Sprintf("users-%d", chatID)
+		now := time.Now().Unix()
+
+		// Add user to members table with user permissions
+		_, err = cc.s.db.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info)
+            VALUES(?,?,?,?,?,0,?)
+            ON CONFLICT(pubkey) DO UPDATE SET banned=0, perms_flags=excluded.perms_flags`, usersTbl),
+			cc.pub[:], "", permUser, now, now, nil)
+		if err != nil {
+			log.Printf("Failed to add user to chat %d: %v", chatID, err)
+			_ = cc.writeErr(reqID, "db error")
+			return
+		}
+
+		// Delete the invite
+		_, err = cc.s.db.Exec(`DELETE FROM invites WHERE id=?`, inviteID)
+		if err != nil {
+			log.Printf("Failed to delete invite %d: %v", inviteID, err)
+			_ = cc.writeErr(reqID, "db error")
+			return
+		}
+
+		// Request member info from client (with timestamp 0 to get all)
+		// Find the client connection for this user and request info
+		// For now, if they're already connected on this same conn, send immediately
+		// Otherwise they'll be asked when they subscribe
+		go cc.requestMemberInfo(chatID)
+
+		log.Printf("Added %x to chat %d members, requesting member info", cc.pub[:4], chatID)
+
+	} else {
+		// User rejected: just delete the invite
+		log.Printf("Invite %d rejected by %x", inviteID, cc.pub[:4])
+
+		_, err = cc.s.db.Exec(`DELETE FROM invites WHERE id=?`, inviteID)
+		if err != nil {
+			log.Printf("Failed to delete invite %d: %v", inviteID, err)
+			_ = cc.writeErr(reqID, "db error")
+			return
+		}
+
+		log.Printf("Deleted rejected invite %d", inviteID)
+	}
+
+	_ = cc.writeOK(reqID, nil)
+}
+
+func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
+	// payload: chat_id(u64), timestamp(u64), encrypted_blob(blob)
+	off := 0
+	if !cc.authed {
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+
+	chatID, err := rdU64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad chat id")
+		return
+	}
+	timestamp, err := rdU64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad timestamp")
+		return
+	}
+	encryptedBlob, err := rdBlob(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad encrypted blob")
+		return
+	}
+
+	// Verify user is a member of the chat
+	_, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
+	if !ok || banned {
+		_ = cc.writeErr(reqID, "not a member or banned")
+		return
+	}
+
+	// Store encrypted member info in users table and bump changed_at
+	usersTbl := fmt.Sprintf("users-%d", chatID)
+	query := fmt.Sprintf(`UPDATE %q SET info=?, changed_at=? WHERE pubkey=?`, usersTbl)
+	_, err = cc.s.db.Exec(query, encryptedBlob, timestamp, cc.pub[:])
+	if err != nil {
+		log.Printf("Failed to update member info for %x in chat %d: %v", cc.pub[:4], chatID, err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
+	// Broadcast updated member info to subscribers (excluding sender) in the same
+	// format as handleGetMembersInfo: [count(u32)][pubkey(32)][infoLen(u32)][info][timestamp(u64)]
+	payload := make([]byte, 4+32+4+len(encryptedBlob)+8)
+	off2 := 0
+	binary.BigEndian.PutUint32(payload[off2:off2+4], 1)
+	off2 += 4
+	copy(payload[off2:off2+32], cc.pub[:])
+	off2 += 32
+	binary.BigEndian.PutUint32(payload[off2:off2+4], uint32(len(encryptedBlob)))
+	off2 += 4
+	copy(payload[off2:off2+len(encryptedBlob)], encryptedBlob)
+	off2 += len(encryptedBlob)
+	binary.BigEndian.PutUint64(payload[off2:off2+8], timestamp)
+	go cc.s.broadcastToChat(chatID, cc, cmdGotMemberInfo, payload)
+
+	log.Printf("Updated member info for %x in chat %d (size=%d bytes)",
+		cc.pub[:4], chatID, len(encryptedBlob))
+	_ = cc.writeOK(reqID, nil)
+}
+
+func (cc *clientConn) handleGetMembersInfo(reqID uint16, p []byte) {
+	// payload: chat_id(u64), timestamp(u64)
+	off := 0
+	if !cc.authed {
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+
+	chatID, err := rdU64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad chat id")
+		return
+	}
+	sinceTimestamp, err := rdU64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad timestamp")
+		return
+	}
+
+	// Verify user is a member of the chat
+	_, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
+	if !ok || banned {
+		_ = cc.writeErr(reqID, "not a member or banned")
+		return
+	}
+
+	// Query all members with info (optionally filtered by timestamp)
+	usersTbl := fmt.Sprintf("users-%d", chatID)
+	var rows *sql.Rows
+	if sinceTimestamp > 0 {
+		// Only return members updated after the given timestamp
+		rows, err = cc.s.db.Query(fmt.Sprintf(
+			`SELECT pubkey, info, changed_at FROM %q WHERE info IS NOT NULL AND changed_at > ?`, usersTbl),
+			sinceTimestamp)
+	} else {
+		// Return all members with info
+		rows, err = cc.s.db.Query(fmt.Sprintf(
+			`SELECT pubkey, info, changed_at FROM %q WHERE info IS NOT NULL`, usersTbl))
+	}
+
+	if err != nil {
+		log.Printf("Failed to query members info for chat %d: %v", chatID, err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+	defer rows.Close()
+
+	// Collect member info
+	type memberInfo struct {
+		pubkey    []byte
+		info      []byte
+		timestamp int64
+	}
+	var members []memberInfo
+
+	for rows.Next() {
+		var m memberInfo
+		if err := rows.Scan(&m.pubkey, &m.info, &m.timestamp); err != nil {
+			continue
+		}
+		members = append(members, m)
+	}
+
+	// Build response: [count(u32)][[pubkey(32)][infoLen(u32)][encryptedInfo][timestamp(u64)]...]
+	payloadSize := 4 // count
+	for _, m := range members {
+		payloadSize += 32 + 4 + len(m.info) + 8
+	}
+
+	payload := make([]byte, payloadSize)
+	offset := 0
+
+	// Write count
+	binary.BigEndian.PutUint32(payload[offset:], uint32(len(members)))
+	offset += 4
+
+	// Write each member's info
+	for _, m := range members {
+		// pubkey (32 bytes)
+		copy(payload[offset:], m.pubkey)
+		offset += 32
+
+		// info length + data
+		binary.BigEndian.PutUint32(payload[offset:], uint32(len(m.info)))
+		offset += 4
+		copy(payload[offset:], m.info)
+		offset += len(m.info)
+
+		// timestamp
+		binary.BigEndian.PutUint64(payload[offset:], uint64(m.timestamp))
+		offset += 8
+	}
+
+	log.Printf("Sending %d member(s) info for chat %d to %x", len(members), chatID, cc.pub[:4])
+	_ = cc.writeOK(reqID, payload)
+}
+
+// handleGetMembers returns the list of all non-banned members' pubkeys for a chat
+func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
+	off := 0
+	if !cc.authed {
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+
+	chatID, err := rdU64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad chat id")
+		return
+	}
+
+	// Verify requester is a member (not banned)
+	if _, banned, ok := cc.lookupPerms(chatID, cc.pub[:]); !ok || banned {
+		_ = cc.writeErr(reqID, "not a member or banned")
+		return
+	}
+
+	usersTbl := fmt.Sprintf("users-%d", chatID)
+	rows, err := cc.s.db.Query(fmt.Sprintf(`SELECT pubkey FROM %q WHERE banned=0`, usersTbl))
+	if err != nil {
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+	defer rows.Close()
+
+	var members [][]byte
+	for rows.Next() {
+		var pk []byte
+		if err := rows.Scan(&pk); err != nil {
+			continue
+		}
+		if len(pk) == 32 {
+			members = append(members, append([]byte(nil), pk...))
+		}
+	}
+
+	// Build response: [count(u32)][pubkey(32) repeated]
+	out := make([]byte, 4+32*len(members))
+	binary.BigEndian.PutUint32(out[0:4], uint32(len(members)))
+	off2 := 4
+	for _, m := range members {
+		copy(out[off2:off2+32], m)
+		off2 += 32
+	}
+	_ = cc.writeOK(reqID, out)
+}
+
+// requestMemberInfo requests updated member info from the client for a specific chat
+func (cc *clientConn) requestMemberInfo(chatID uint64) {
+	// Get last update timestamp from database (if info exists)
+	usersTbl := fmt.Sprintf("users-%d", chatID)
+	var lastUpdate int64
+
+	// Try to get the existing info timestamp
+	// If no info exists yet, use 0 as lastUpdate
+	err := cc.s.db.QueryRow(fmt.Sprintf(`SELECT IFNULL(changed_at, 0) FROM %q WHERE pubkey=?`, usersTbl), cc.pub[:]).
+		Scan(&lastUpdate)
+	if err != nil {
+		log.Printf("Could not get last update for %x in chat %d: %v", cc.pub[:4], chatID, err)
+		lastUpdate = 0
+	}
+
+	// Build request payload: [chatID(u64)][lastUpdate(u64)]
+	payload := make([]byte, 16)
+	binary.BigEndian.PutUint64(payload[0:8], chatID)
+	binary.BigEndian.PutUint64(payload[8:16], uint64(lastUpdate))
+
+	// Send request as a push notification (using cmdRequestMemberInfo as reqID)
+	if err := cc.writeOK(cmdRequestMemberInfo, payload); err != nil {
+		log.Printf("Failed to request member info from %x for chat %d: %v", cc.pub[:4], chatID, err)
+		return
+	}
+
+	log.Printf("Requested member info from %x for chat %d (last update: %d)", cc.pub[:4], chatID, lastUpdate)
 }
 
 // ---------------- utilities ----------------
@@ -1329,7 +1733,6 @@ func (s *serverState) subscribe(chatID uint64, cc *clientConn) {
 // Unsubscribe the connection from all chats (called on disconnect)
 func (s *serverState) unsubscribeAll(cc *clientConn) {
 	s.chatMu.Lock()
-	defer s.chatMu.Unlock()
 	for chatID := range cc.chats {
 		if set, ok := s.chatSubscriptions[chatID]; ok {
 			delete(set, cc)
@@ -1339,6 +1742,15 @@ func (s *serverState) unsubscribeAll(cc *clientConn) {
 		}
 	}
 	cc.chats = make(map[uint64]struct{})
+	s.chatMu.Unlock()
+
+	// Remove from authenticated clients map if this client was authenticated
+	if cc.authed {
+		s.authClientsMu.Lock()
+		delete(s.authenticatedClients, cc.pub)
+		s.authClientsMu.Unlock()
+		log.Printf("[DEBUG] Removed authenticated client %x from tracking", cc.pub[:4])
+	}
 }
 
 // Broadcast message to all subscribers of chatID except sender
@@ -1355,6 +1767,22 @@ func (s *serverState) broadcastMessage(chatID uint64, sender *clientConn, msgPay
 		}
 		// asynchronous, ignore write errors
 		go cc.writeOK(cmdGotMessage, msgPayload)
+	}
+}
+
+// broadcastToChat sends a custom payload with the given requestId to all subscribers except sender
+func (s *serverState) broadcastToChat(chatID uint64, sender *clientConn, requestId uint16, payload []byte) {
+	s.chatMu.RLock()
+	defer s.chatMu.RUnlock()
+	set, ok := s.chatSubscriptions[chatID]
+	if !ok {
+		return
+	}
+	for cc := range set {
+		if cc == sender {
+			continue
+		}
+		go cc.writeOK(requestId, payload)
 	}
 }
 
@@ -1386,304 +1814,23 @@ func equalBytes(a, b []byte) bool {
 
 // ---------------- invite delivery ----------------
 
-// inviteDeliveryWorker processes invite delivery queue
-func (s *serverState) inviteDeliveryWorker(ctx context.Context) {
-	backoff := 30 * time.Second
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case userPub := <-s.inviteQueue:
-			// Check if already dialing
-			s.inviteDialMu.Lock()
-			if _, exists := s.inviteDialers[userPub]; exists {
-				s.inviteDialMu.Unlock()
-				continue // already being dialed
-			}
-			s.inviteDialers[userPub] = struct{}{}
-			s.inviteDialMu.Unlock()
-
-			// Process this user's invites
-			go func(pub [32]byte) {
-				defer func() {
-					s.inviteDialMu.Lock()
-					delete(s.inviteDialers, pub)
-					s.inviteDialMu.Unlock()
-				}()
-
-				// Try to deliver invites with retry
-				for attempt := 0; attempt < 3; attempt++ {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-					}
-
-					if attempt > 0 {
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(backoff):
-						}
-					}
-
-					if s.deliverInvitesToUser(ctx, pub) {
-						return // success
-					}
-					log.Printf("Failed to deliver invites to %x… (attempt %d/3)", pub[:4], attempt+1)
-				}
-				log.Printf("Giving up on delivering invites to %x… after 3 attempts", pub[:4])
-			}(userPub)
-		}
-	}
-}
-
-// inviteCleanupWorker periodically scans for old invites and retries pending ones
-func (s *serverState) inviteCleanupWorker(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	// Run once immediately on startup
-	s.processPendingInvites()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.processPendingInvites()
-		}
-	}
-}
-
-// processPendingInvites checks all pending invites, deletes old ones, and retries others
-func (s *serverState) processPendingInvites() {
-	const threeDaysSeconds = 3 * 24 * 60 * 60 // 259200 seconds
-	now := time.Now().Unix()
-
-	// Query all pending invites with their unique recipients
-	rows, err := s.db.Query(`SELECT DISTINCT to_pubkey, MIN(timestamp) as oldest_ts FROM invites GROUP BY to_pubkey`)
+// sendInviteToClient sends an invite notification to a connected client
+func (s *serverState) sendInviteToClient(cc *clientConn, inviteID int64, timestamp int64, fromPubkey []byte, chatID uint64, encryptedData []byte) bool {
+	// Get chat metadata
+	var chatName, chatDesc string
+	var chatAvatar []byte
+	settTbl := fmt.Sprintf("settings-%d", chatID)
+	err := s.db.QueryRow(fmt.Sprintf(`SELECT name, description, avatar FROM %q`, settTbl)).
+		Scan(&chatName, &chatDesc, &chatAvatar)
 	if err != nil {
-		log.Printf("Failed to query pending invites: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	var toDelete [][32]byte
-	var toRetry [][32]byte
-
-	for rows.Next() {
-		var toPubkey []byte
-		var oldestTs int64
-		if err := rows.Scan(&toPubkey, &oldestTs); err != nil {
-			continue
-		}
-
-		age := now - oldestTs
-		var pub [32]byte
-		copy(pub[:], toPubkey)
-
-		if age > threeDaysSeconds {
-			// Mark for deletion
-			toDelete = append(toDelete, pub)
-		} else {
-			// Mark for retry
-			toRetry = append(toRetry, pub)
-		}
-	}
-
-	// Delete old invites
-	for _, pub := range toDelete {
-		result, err := s.db.Exec(`DELETE FROM invites WHERE to_pubkey=?`, pub[:])
-		if err != nil {
-			log.Printf("Failed to delete old invites for %x…: %v", pub[:4], err)
-		} else {
-			if count, _ := result.RowsAffected(); count > 0 {
-				log.Printf("Deleted %d old invite(s) for %x… (older than 3 days)", count, pub[:4])
-			}
-		}
-	}
-
-	// Queue for retry (if not already being dialed)
-	for _, pub := range toRetry {
-		s.inviteDialMu.Lock()
-		_, alreadyDialing := s.inviteDialers[pub]
-		s.inviteDialMu.Unlock()
-
-		if alreadyDialing {
-			continue // skip, already being processed
-		}
-
-		// Try to queue (non-blocking)
-		select {
-		case s.inviteQueue <- pub:
-			log.Printf("Queued pending invite retry for %x…", pub[:4])
-		default:
-			// Queue full, skip this retry cycle
-		}
-	}
-
-	if len(toDelete) > 0 || len(toRetry) > 0 {
-		log.Printf("Invite cleanup: deleted %d old, queued %d for retry", len(toDelete), len(toRetry))
-	}
-}
-
-// deliverInvitesToUser connects to a user and delivers all pending invites
-func (s *serverState) deliverInvitesToUser(ctx context.Context, userPub [32]byte) bool {
-	// Fetch all invites for this user
-	rows, err := s.db.Query(`SELECT id, timestamp, from_pubkey, chat_id, encrypted_data FROM invites WHERE to_pubkey=?`, userPub[:])
-	if err != nil {
-		log.Printf("Failed to query invites for %x…: %v", userPub[:4], err)
-		return false
-	}
-	defer rows.Close()
-
-	type invite struct {
-		id            int64
-		timestamp     int64
-		fromPubkey    []byte
-		chatID        uint64
-		encryptedData []byte
-	}
-
-	var invites []invite
-	for rows.Next() {
-		var inv invite
-		if err := rows.Scan(&inv.id, &inv.timestamp, &inv.fromPubkey, &inv.chatID, &inv.encryptedData); err != nil {
-			continue
-		}
-		invites = append(invites, inv)
-	}
-
-	if len(invites) == 0 {
-		return true // no invites to deliver
-	}
-
-	// Dial the user
-	userPubHex := fmt.Sprintf("%x", userPub[:])
-	conn, err := s.transport.DialContext(ctx, "yggdrasil", userPubHex)
-	if err != nil {
-		log.Printf("Failed to dial %x…: %v", userPub[:4], err)
-		return false
-	}
-	defer conn.Close()
-
-	// Authenticate as mediator
-	if !s.authenticateToUser(conn, userPub) {
-		log.Printf("Failed to authenticate to %x…", userPub[:4])
+		log.Printf("Failed to get chat metadata for %d: %v", chatID, err)
 		return false
 	}
 
-	// Deliver each invite
-	success := true
-	for _, inv := range invites {
-		// Get chat metadata
-		var chatName, chatDesc string
-		var chatAvatar []byte
-		settTbl := fmt.Sprintf("settings-%d", inv.chatID)
-		err := s.db.QueryRow(fmt.Sprintf(`SELECT name, description, avatar FROM %q`, settTbl)).
-			Scan(&chatName, &chatDesc, &chatAvatar)
-		if err != nil {
-			log.Printf("Failed to get chat metadata for %d: %v", inv.chatID, err)
-			continue
-		}
-
-		if s.sendInviteMessage(conn, inv.timestamp, inv.fromPubkey, inv.chatID, chatName, chatDesc, chatAvatar, inv.encryptedData) {
-			// Delete invite from database
-			_, err := s.db.Exec(`DELETE FROM invites WHERE id=?`, inv.id)
-			if err != nil {
-				log.Printf("Failed to delete delivered invite %d: %v", inv.id, err)
-			} else {
-				log.Printf("Successfully delivered invite %d to %x…", inv.id, userPub[:4])
-			}
-		} else {
-			log.Printf("Failed to send invite %d to %x…", inv.id, userPub[:4])
-			success = false
-		}
-	}
-
-	return success
-}
-
-// authenticateToUser performs authentication as mediator to user's client
-func (s *serverState) authenticateToUser(conn net.Conn, userPub [32]byte) bool {
-	// Send GET_NONCE request
-	reqID := uint16(1)
-	payload := s.pub[:]
-
-	var reqFrame [8]byte
-	reqFrame[0] = version
-	reqFrame[1] = cmdGetNonce
-	binary.BigEndian.PutUint16(reqFrame[2:4], reqID)
-	binary.BigEndian.PutUint32(reqFrame[4:8], uint32(len(payload)))
-
-	if _, err := conn.Write(reqFrame[:]); err != nil {
-		return false
-	}
-	if _, err := conn.Write(payload); err != nil {
-		return false
-	}
-
-	// Read nonce response
-	var respHdr [7]byte
-	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return false
-	}
-	if _, err := io.ReadFull(conn, respHdr[:]); err != nil {
-		return false
-	}
-
-	if respHdr[0] != statusOK {
-		return false
-	}
-
-	payloadLen := binary.BigEndian.Uint32(respHdr[3:7])
-	if payloadLen != 32 {
-		return false
-	}
-
-	var nonce [32]byte
-	if _, err := io.ReadFull(conn, nonce[:]); err != nil {
-		return false
-	}
-
-	// Sign nonce
-	signature := ed25519.Sign(s.priv, nonce[:])
-
-	// Send AUTH request
-	reqID = 2
-	authPayload := make([]byte, 32+32+64)
-	copy(authPayload[0:32], s.pub[:])
-	copy(authPayload[32:64], nonce[:])
-	copy(authPayload[64:128], signature)
-
-	reqFrame[0] = version
-	reqFrame[1] = cmdAuth
-	binary.BigEndian.PutUint16(reqFrame[2:4], reqID)
-	binary.BigEndian.PutUint32(reqFrame[4:8], uint32(len(authPayload)))
-
-	if _, err := conn.Write(reqFrame[:]); err != nil {
-		return false
-	}
-	if _, err := conn.Write(authPayload); err != nil {
-		return false
-	}
-
-	// Read AUTH response
-	if _, err := io.ReadFull(conn, respHdr[:]); err != nil {
-		return false
-	}
-
-	return respHdr[0] == statusOK
-}
-
-// sendInviteMessage sends an invitation notification to connected user
-func (s *serverState) sendInviteMessage(conn net.Conn, timestamp int64, fromPubkey []byte, chatID uint64, chatName, chatDesc string, chatAvatar, encryptedData []byte) bool {
-
-	// Build payload: timestamp(8), from_pubkey(32), chat_id(8),
+	// Build payload: inviteId(8), chat_id(8), from_pubkey(32), timestamp(8),
 	// chat_name(str), chat_desc(str), chat_avatar(blob), encrypted_data(blob)
-	payloadSize := 8 + 32 + 8 +
+	// Must match Android client format in MediatorClient.kt line 606
+	payloadSize := 8 + 8 + 32 + 8 +
 		2 + len(chatName) +
 		2 + len(chatDesc) +
 		4 + len(chatAvatar) +
@@ -1692,16 +1839,20 @@ func (s *serverState) sendInviteMessage(conn net.Conn, timestamp int64, fromPubk
 	payload := make([]byte, payloadSize)
 	off := 0
 
-	// timestamp
-	binary.BigEndian.PutUint64(payload[off:], uint64(timestamp))
+	// invite_id
+	binary.BigEndian.PutUint64(payload[off:], uint64(inviteID))
+	off += 8
+
+	// chat_id
+	binary.BigEndian.PutUint64(payload[off:], chatID)
 	off += 8
 
 	// from_pubkey
 	copy(payload[off:], fromPubkey)
 	off += 32
 
-	// chat_id
-	binary.BigEndian.PutUint64(payload[off:], chatID)
+	// timestamp
+	binary.BigEndian.PutUint64(payload[off:], uint64(timestamp))
 	off += 8
 
 	// chat_name (string)
@@ -1727,24 +1878,94 @@ func (s *serverState) sendInviteMessage(conn net.Conn, timestamp int64, fromPubk
 	off += 4
 	copy(payload[off:], encryptedData)
 
-	// Send as cmdGotInvite (no request/response, just notification)
-	var frame [8]byte
-	frame[0] = version
-	frame[1] = cmdGotInvite
-	binary.BigEndian.PutUint16(frame[2:4], 0) // reqID=0 for notifications
-	binary.BigEndian.PutUint32(frame[4:8], uint32(len(payload)))
-
-	if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return false
-	}
-	if _, err := conn.Write(frame[:]); err != nil {
-		return false
-	}
-	if _, err := conn.Write(payload); err != nil {
+	// Send as notification using cmdGotInvite with reqID=0
+	if err := cc.writeOK(cmdGotInvite, payload); err != nil {
+		log.Printf("Failed to send invite notification to %x: %v", cc.pub[:4], err)
 		return false
 	}
 
+	// Mark invite as sent (best-effort)
+	if _, err := s.db.Exec(`UPDATE invites SET sent=1 WHERE id=?`, inviteID); err != nil {
+		log.Printf("Warning: failed to mark invite %d as sent: %v", inviteID, err)
+	}
+
+	// NOTE: Do NOT delete the invite here. The invite stays in the database until the user
+	// accepts or rejects it via handleInviteResponse. This ensures we have a record of the
+	// invitation and the user can be added to the members table with confirmation.
+	log.Printf("Successfully delivered invite %d to connected user %x (invite kept for response)", inviteID, cc.pub[:4])
 	return true
+}
+
+// sendPendingInvites sends all pending invites for a user to their connected client
+func (s *serverState) sendPendingInvites(cc *clientConn) {
+	// Fetch all unsent invites for this user
+	rows, err := s.db.Query(`SELECT id, timestamp, from_pubkey, chat_id, encrypted_data FROM invites WHERE to_pubkey=? AND sent=0`, cc.pub[:])
+	if err != nil {
+		log.Printf("Failed to query pending invites for %x: %v", cc.pub[:4], err)
+		return
+	}
+	defer rows.Close()
+
+	type invite struct {
+		id            int64
+		timestamp     int64
+		fromPubkey    []byte
+		chatID        uint64
+		encryptedData []byte
+	}
+
+	var invites []invite
+	for rows.Next() {
+		var inv invite
+		if err := rows.Scan(&inv.id, &inv.timestamp, &inv.fromPubkey, &inv.chatID, &inv.encryptedData); err != nil {
+			continue
+		}
+		invites = append(invites, inv)
+	}
+
+	if len(invites) == 0 {
+		return
+	}
+
+	log.Printf("Sending %d pending invite(s) to %x", len(invites), cc.pub[:4])
+	for _, inv := range invites {
+		s.sendInviteToClient(cc, inv.id, inv.timestamp, inv.fromPubkey, inv.chatID, inv.encryptedData)
+	}
+}
+
+// inviteCleanupWorker periodically removes old invites from the database
+func (s *serverState) inviteCleanupWorker(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	// Run once immediately on startup
+	s.cleanupOldInvites()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.cleanupOldInvites()
+		}
+	}
+}
+
+// cleanupOldInvites deletes invites older than 3 days
+func (s *serverState) cleanupOldInvites() {
+	const threeDaysSeconds = 3 * 24 * 60 * 60 // 259200 seconds
+	now := time.Now().Unix()
+	cutoff := now - threeDaysSeconds
+
+	result, err := s.db.Exec(`DELETE FROM invites WHERE timestamp < ?`, cutoff)
+	if err != nil {
+		log.Printf("Failed to clean up old invites: %v", err)
+		return
+	}
+
+	if count, _ := result.RowsAffected(); count > 0 {
+		log.Printf("Cleaned up %d old invite(s) (older than 3 days)", count)
+	}
 }
 
 // ---------------- end ----------------
