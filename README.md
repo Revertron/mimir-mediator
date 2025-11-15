@@ -73,11 +73,11 @@ You’ll see log output with your public key prefix (for debugging).
 
 Each chat room `id` has its own three tables:
 
-| Table           | Purpose                                                       |
-| --------------- | ------------------------------------------------------------- |
-| `settings-{id}` | Room metadata (name, description, avatar, permissions).       |
-| `users-{id}`    | Members list and their roles (owner/admin/mod/user/readonly). |
-| `messages-{id}` | Stored messages (id, timestamp, blob, author).                |
+| Table           | Purpose                                                                         |
+| --------------- | ------------------------------------------------------------------------------- |
+| `settings-{id}` | Room metadata (name, description, avatar, permissions).                         |
+| `users-{id}`    | Members list and their roles (owner/admin/mod/user/readonly).                   |
+| `messages-{id}` | Message metadata (id, timestamp, guid, author) - includes user/system messages. |
 
 ---
 
@@ -133,12 +133,21 @@ Each request/response is a framed binary packet.
 | `DELETE_USER`         | 0x21 | C→S       | Ban/remove user from chat.                      |
 | `LEAVE_CHAT`          | 0x22 | C→S       | User leaves chat (deleted from users table).    |
 | `GET_USER_CHATS`      | 0x23 | C→S       | List all chats user belongs to (not banned).    |
+| `PING`                | 0x03 | C→S       | Keep-alive ping.                                |
 | `SEND_MESSAGE`        | 0x30 | C→S       | Send encrypted message blob to chat.            |
 | `DELETE_MESSAGE`      | 0x31 | C→S       | Delete message (admin/mod only).                |
-| `GET_MESSAGE`         | 0x32 | C→S       | Retrieve one message by ID.                     |
+| `GOT_MESSAGE`         | 0x32 | S→C       | Server-pushed message (user/system).            |
 | `GET_LAST_MESSAGE_ID` | 0x33 | C→S       | Query the latest message ID.                    |
-| `GOT_MESSAGE`         | 0x34 | S→C       | Server-pushed new message notification.         |
 | `SUBSCRIBE`           | 0x35 | C→S       | Subscribe connection to live updates of a chat. |
+| `GET_MESSAGES_SINCE`  | 0x36 | C→S       | Batch fetch messages since ID.                  |
+| `SEND_INVITE`         | 0x40 | C→S       | Send invite to user.                            |
+| `GOT_INVITE`          | 0x41 | S→C       | Server-pushed invite delivery.                  |
+| `INVITE_RESPONSE`     | 0x42 | C→S       | Client responds to invite (accept/reject).      |
+| `UPDATE_MEMBER_INFO`  | 0x50 | C→S       | Update member info (nickname, avatar).          |
+| `REQUEST_MEMBER_INFO` | 0x51 | S→C       | Server requests member info from client.        |
+| `GET_MEMBERS_INFO`    | 0x52 | C→S       | Get all members info (snapshot/incremental).    |
+| `GET_MEMBERS`         | 0x53 | C→S       | Get list of member public keys.                 |
+| `GOT_MEMBER_INFO`     | 0x54 | S→C       | Server-pushed member info updated.              |
 
 ---
 
@@ -184,7 +193,6 @@ When a user sends a message:
 * No TTL cleanup for old nonces (to be added).
 * No user nickname or text rank logic implemented yet.
 * Owner cannot leave their own chat (must delete instead).
-* No system messages for join/leave/banned actions (TODO markers present).
 
 ---
 

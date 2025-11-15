@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -108,10 +109,10 @@ const (
 	cmdGetUserChats      = 0x23
 	cmdSendMessage       = 0x30
 	cmdDeleteMessage     = 0x31
-	cmdGetMessage        = 0x32
+	cmdGotMessage        = 0x32 // Server sends it to the client after receiving a message from some user.
 	cmdGetLastMessageID  = 0x33
-	cmdGotMessage        = 0x34 // Server sends it to the client after receiving a message from some user.
 	cmdSubscribe         = 0x35
+	cmdGetMessagesSince  = 0x36 // NEW: batch fetch messages
 	cmdSendInvite        = 0x40
 	cmdGotInvite         = 0x41 // Server sends it to the client when delivering an invite.
 	cmdInviteResponse    = 0x42 // Client responds to invite (accept/reject)
@@ -133,6 +134,16 @@ const (
 	permReadOnly = 0x08
 	permBanned   = 0x01
 
+	// system event codes (first byte of system message body)
+	// System messages are stored as regular messages with mediator as author
+	sysUserAdded      = 0x01
+	sysUserEntered    = 0x02 // reserved
+	sysUserLeft       = 0x03
+	sysUserBanned     = 0x04
+	sysChatDeleted    = 0x05
+	sysChatInfoChange = 0x06
+	sysPermsChanged   = 0x07
+
 	maxNameLen       = 20
 	maxDescLen       = 200
 	maxAvatarBytes   = 200 * 1024
@@ -150,11 +161,11 @@ type serverState struct {
 	authMu    sync.Mutex
 	// chatSubscriptions: chatID → set of client connections
 	chatMu            sync.RWMutex
-	chatSubscriptions map[uint64]map[*clientConn]struct{}
+	chatSubscriptions map[int64]map[*clientConn]struct{}
 	cache             *hybridcache.HybridCache
-	// authenticated clients tracking: pubkey → client connection
+	// authenticated clients tracking: pubkey → set of client connections (multi-device support)
 	authClientsMu        sync.RWMutex
-	authenticatedClients map[[32]byte]*clientConn
+	authenticatedClients map[[32]byte]map[*clientConn]struct{}
 }
 
 // connection-scoped state
@@ -163,7 +174,7 @@ type clientConn struct {
 	s      *serverState
 	authed bool
 	pub    [32]byte
-	chats  map[uint64]struct{} // chats this client subscribed to
+	chats  map[int64]struct{} // chats this client subscribed to
 }
 
 func main() {
@@ -233,9 +244,9 @@ func main() {
 		transport:            m.GetTransport(),
 		priv:                 priv,
 		pub:                  pub,
-		chatSubscriptions:    make(map[uint64]map[*clientConn]struct{}),
+		chatSubscriptions:    make(map[int64]map[*clientConn]struct{}),
 		cache:                cache,
-		authenticatedClients: make(map[[32]byte]*clientConn),
+		authenticatedClients: make(map[[32]byte]map[*clientConn]struct{}),
 	}
 
 	log.Printf("mediator started; pubkey: %x", pub[:])
@@ -289,12 +300,12 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 		return
 	}
 
-	cc := &clientConn{conn: c, s: s, chats: make(map[uint64]struct{})}
+	cc := &clientConn{conn: c, s: s, chats: make(map[int64]struct{})}
 	defer cc.s.unsubscribeAll(cc)
 	log.Printf("[DEBUG] Client connection initialized, entering command loop")
 
 	for {
-		if err := c.Stream.SetReadDeadline(time.Now().Add(10 * time.Minute)); err != nil {
+		if err := c.Stream.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
 			log.Printf("[DEBUG] Failed to set read deadline: %v", err)
 			return
 		}
@@ -345,12 +356,12 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 			cc.handleLeaveChat(reqId, payload)
 		case cmdSubscribe:
 			cc.handleSubscribe(reqId, payload)
+		case cmdGetMessagesSince:
+			cc.handleGetMessagesSince(reqId, payload)
 		case cmdSendMessage:
 			cc.handleSendMessage(reqId, payload)
 		case cmdDeleteMessage:
 			cc.handleDeleteMessage(reqId, payload)
-		case cmdGetMessage:
-			cc.handleGetMessage(reqId, payload)
 		case cmdGetLastMessageID:
 			cc.handleGetLastMessageID(reqId, payload)
 		case cmdSendInvite:
@@ -457,14 +468,85 @@ func migrateUsersChangedAt(db *sql.DB) {
 	}
 }
 
-func chatTableNames(id uint64) (settings, users, messages string) {
+func chatTableNames(id int64) (settings, users, messages string) {
 	settings = fmt.Sprintf("settings-%d", id)
 	users = fmt.Sprintf("users-%d", id)
 	messages = fmt.Sprintf("messages-%d", id)
 	return
 }
 
-func createChatTables(tx *sql.Tx, id uint64) error {
+// generateMessageGuid creates a GUID for system messages using the same
+// algorithm as the client: (hash(data) << 32) ^ timestamp
+// This matches the Kotlin implementation: data.contentHashCode().toLong() shl 32 xor time
+func generateMessageGuid(ts int64, data []byte) int64 {
+	// Compute hash similar to Kotlin's ByteArray.contentHashCode()
+	hash := int32(1)
+	for _, b := range data {
+		hash = 31*hash + int32(int8(b))
+	}
+	return (int64(hash) << 32) ^ ts
+}
+
+func rand32() []byte {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// leave zeros on RNG failure; still keep length
+	}
+	return b
+}
+
+// broadcastSystemMessage creates, stores, and broadcasts a system message
+// If storeInDB is false, only broadcasts without database storage (e.g., for chat deletion)
+// Returns the message ID (0 if not stored) and any error
+func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *clientConn, storeInDB bool) (int64, error) {
+	now := time.Now().Unix()
+	guid := generateMessageGuid(now, body)
+
+	var msgID int64
+	if storeInDB {
+		// Insert into messages table
+		msgTbl := fmt.Sprintf("messages-%d", chatID)
+		res, err := s.db.Exec(
+			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
+			now, guid, s.pub,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("failed to insert system message: %w", err)
+		}
+		msgID, _ = res.LastInsertId()
+
+		// Store body in cache
+		key := fmt.Sprintf("%016x:%016x", chatID, guid)
+		if err := s.cache.Set(key, body, 24*time.Hour); err != nil {
+			log.Printf("cache set failed for system message: %v", err)
+		}
+	}
+
+	// Broadcast as regular message: [chat_id(i64)][msg_id(i64)][guid(i64)][author(32)][blob_len(u32)][blob]
+	push := make([]byte, 8+8+8+32+4+len(body))
+	off := 0
+	binary.BigEndian.PutUint64(push[off:off+8], uint64(chatID))
+	off += 8
+	binary.BigEndian.PutUint64(push[off:off+8], uint64(msgID))
+	off += 8
+	binary.BigEndian.PutUint64(push[off:off+8], uint64(guid))
+	off += 8
+	copy(push[off:off+32], s.pub[:])
+	off += 32
+	binary.BigEndian.PutUint32(push[off:off+4], uint32(len(body)))
+	off += 4
+	copy(push[off:], body)
+
+	if sender != nil {
+		go s.broadcastMessage(chatID, sender, push)
+	} else {
+		go s.broadcastToChat(chatID, nil, cmdGotMessage, push)
+	}
+
+	return msgID, nil
+}
+
+func createChatTables(tx *sql.Tx, id int64) error {
 	sett, users, msgs := chatTableNames(id)
 	ddl := fmt.Sprintf(`
 CREATE TABLE %q(
@@ -487,7 +569,7 @@ CREATE TABLE %q(
 CREATE TABLE %q(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
-  guid INTEGER NOT NULL,
+  guid INTEGER NOT NULL UNIQUE,
   author BLOB(32) NOT NULL
 );
 `, sett, maxNameLen, maxDescLen, users, msgs)
@@ -531,6 +613,16 @@ func (cc *clientConn) writeErr(requestId uint16, msg string) error {
 	return err
 }
 
+func rdI64(b []byte, off *int) (int64, error) {
+	if *off+8 > len(b) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	v := int64(binary.BigEndian.Uint64(b[*off : *off+8]))
+	*off += 8
+	return v, nil
+}
+
+// Keep rdU64 for timestamps and other unsigned values
 func rdU64(b []byte, off *int) (uint64, error) {
 	if *off+8 > len(b) {
 		return 0, io.ErrUnexpectedEOF
@@ -664,10 +756,15 @@ func (cc *clientConn) handleAuth(reqID uint16, p []byte) {
 	cc.authed = true
 	cc.pub = pk
 
-	// Register this client as authenticated
+	// Register this client as authenticated (multi-device support)
 	cc.s.authClientsMu.Lock()
-	cc.s.authenticatedClients[pk] = cc
+	if cc.s.authenticatedClients[pk] == nil {
+		cc.s.authenticatedClients[pk] = make(map[*clientConn]struct{})
+	}
+	cc.s.authenticatedClients[pk][cc] = struct{}{}
+	deviceCount := len(cc.s.authenticatedClients[pk])
 	cc.s.authClientsMu.Unlock()
+	log.Printf("[DEBUG] Registered device for user %x (total devices: %d)", pk[:4], deviceCount)
 
 	// Send OK response first
 	_ = cc.writeOK(reqID, nil)
@@ -763,14 +860,13 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 		// Don't fail the request, just log warning
 	}
 
-	// generate chat id
+	// generate chat id (positive int64)
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		_ = cc.writeErr(reqID, "rng")
 		return
 	}
-	chatID := binary.BigEndian.Uint64(b[:])
-	chatID &= math.MaxInt64 // mask off the sign bit
+	chatID := int64(binary.BigEndian.Uint64(b[:]) & math.MaxInt64)
 	if chatID == 0 {
 		chatID = 1 // avoid 0
 	}
@@ -820,16 +916,16 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 		return
 	}
 
-	// response: chat_id(u64)
+	// response: chat_id(i64)
 	resp := make([]byte, 8)
-	binary.BigEndian.PutUint64(resp, chatID)
+	binary.BigEndian.PutUint64(resp, uint64(chatID))
 	_ = cc.writeOK(reqID, resp)
 }
 
 func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
-	// payload: chat_id(u64), owner_pubkey(32), nonce(str), signature(64)
+	// payload: chat_id(i64), owner_pubkey(32), nonce(str), signature(64)
 	off := 0
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -879,6 +975,34 @@ func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
 		return
 	}
 
+	// System message: chat deleted (broadcast only; tables dropped)
+	// Format: [event_code(1)][actor(32)][random(32)]
+	ts := time.Now().Unix()
+	body := make([]byte, 1+32+32)
+	body[0] = sysChatDeleted
+	copy(body[1:33], cc.pub[:])
+	copy(body[33:65], rand32())
+
+	// Generate GUID (no database storage since chat is deleted)
+	guid := generateMessageGuid(ts, body)
+
+	// Broadcast using cmdGotMessage format: [chat_id(i64)][msg_id(i64)][guid(i64)][author(32)][blob_len(u32)][blob]
+	// msg_id is 0 since there's no database entry
+	push := make([]byte, 8+8+8+32+4+len(body))
+	off2 := 0
+	binary.BigEndian.PutUint64(push[off2:off2+8], uint64(chatID))
+	off2 += 8
+	binary.BigEndian.PutUint64(push[off2:off2+8], 0) // msg_id = 0 (no database entry)
+	off2 += 8
+	binary.BigEndian.PutUint64(push[off2:off2+8], uint64(guid))
+	off2 += 8
+	copy(push[off2:off2+32], cc.s.pub[:])
+	off2 += 32
+	binary.BigEndian.PutUint32(push[off2:off2+4], uint32(len(body)))
+	off2 += 4
+	copy(push[off2:], body)
+	go cc.s.broadcastToChat(chatID, cc, cmdGotMessage, push)
+
 	// Remove from subscription map
 	cc.s.chatMu.Lock()
 	if subs, ok := cc.s.chatSubscriptions[chatID]; ok {
@@ -903,7 +1027,7 @@ func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -935,7 +1059,20 @@ func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "db error")
 		return
 	}
-	// TODO add a "user added/entered" system message to the chat
+	// System message: user added by cc.pub (include 32-byte random tail)
+	// Format: [event_code(1)][target_user(32)][actor(32)][random(32)]
+	body := make([]byte, 1+32+32+32)
+	body[0] = sysUserAdded
+	copy(body[1:33], newUser)
+	copy(body[33:65], cc.pub[:])
+	copy(body[65:97], rand32())
+
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+		log.Printf("ERROR: %v", err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
 	_ = cc.writeOK(reqID, nil)
 }
 
@@ -946,7 +1083,7 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -975,7 +1112,20 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "db error")
 		return
 	}
-	// TODO add a "user banned" system message to the chat
+	// System message: user banned by cc.pub (include 32-byte random tail)
+	// Format: [event_code(1)][target_user(32)][actor(32)][random(32)]
+	body := make([]byte, 1+32+32+32)
+	body[0] = sysUserBanned
+	copy(body[1:33], userPK)
+	copy(body[33:65], cc.pub[:])
+	copy(body[65:97], rand32())
+
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+		log.Printf("ERROR: %v", err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
 	_ = cc.writeOK(reqID, nil)
 }
 
@@ -992,9 +1142,9 @@ func (cc *clientConn) handleGetUserChats(reqID uint16, p []byte) {
 	}
 	defer rows.Close()
 
-	var chatIDs []uint64
+	var chatIDs []int64
 	for rows.Next() {
-		var id uint64
+		var id int64
 		if err := rows.Scan(&id); err != nil {
 			continue
 		}
@@ -1022,7 +1172,7 @@ func (cc *clientConn) handleGetUserChats(reqID uint16, p []byte) {
 	resp := make([]byte, 4+len(chatIDs)*8)
 	binary.BigEndian.PutUint32(resp[0:4], uint32(len(chatIDs)))
 	for i, id := range chatIDs {
-		binary.BigEndian.PutUint64(resp[4+i*8:], id)
+		binary.BigEndian.PutUint64(resp[4+i*8:], uint64(id))
 	}
 
 	_ = cc.writeOK(reqID, resp)
@@ -1034,7 +1184,7 @@ func (cc *clientConn) handleLeaveChat(reqID uint16, p []byte) {
 		return
 	}
 	off := 0
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(0, "bad chat id")
 		return
@@ -1068,7 +1218,19 @@ func (cc *clientConn) handleLeaveChat(reqID uint16, p []byte) {
 	// Remove from client’s personal subscription list
 	delete(cc.chats, chatID)
 
-	// TODO add a "user left" system message to the chat
+	// System message: user left (include 32-byte random tail)
+	// Format: [event_code(1)][user(32)][random(32)]
+	body := make([]byte, 1+32+32)
+	body[0] = sysUserLeft
+	copy(body[1:33], cc.pub[:])
+	copy(body[33:65], rand32())
+
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+		log.Printf("ERROR: %v", err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	_, err = cc.s.db.Exec(fmt.Sprintf(`DELETE FROM %q WHERE pubkey=?`, usersTbl), cc.pub[:])
 	if err != nil {
@@ -1085,7 +1247,7 @@ func (cc *clientConn) handleSubscribe(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -1101,11 +1263,120 @@ func (cc *clientConn) handleSubscribe(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "read-only user")
 		return
 	}
+
+	// Get last message ID for this chat
+	msgTbl := fmt.Sprintf("messages-%d", chatID)
+	var lastID sql.NullInt64
+	err = cc.s.db.QueryRow(fmt.Sprintf(`SELECT IFNULL(MAX(id),0) FROM %q`, msgTbl)).Scan(&lastID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
 	cc.s.subscribe(chatID, cc)
-	_ = cc.writeOK(reqID, nil)
+
+	// Return OK with last_message_id in payload
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, uint64(lastID.Int64))
+	_ = cc.writeOK(reqID, out)
 
 	// Request member info update from client
 	go cc.requestMemberInfo(chatID)
+}
+
+// handleGetMessagesSince fetches multiple messages in a single request
+// Request: [chatId(i64)][sinceMessageId(i64)][limit(u32)]
+// Response: [count(u32)][[chatId(i64)][msgId(i64)][guid(u64)][author(32)][blobLen(u32)][blob]...]
+func (cc *clientConn) handleGetMessagesSince(reqID uint16, p []byte) {
+	off := 0
+	if !cc.authed {
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+	chatID, err := rdI64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad chat id")
+		return
+	}
+	sinceMessageID, err := rdI64(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad message id")
+		return
+	}
+	limitRaw, err := rdU32(p, &off)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad limit")
+		return
+	}
+	if limitRaw == 0 || limitRaw > 500 {
+		_ = cc.writeErr(reqID, "limit must be between 1 and 500")
+		return
+	}
+
+	// Ensure caller is a chat member (read perms implied)
+	_, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
+	if !ok || banned {
+		_ = cc.writeErr(reqID, "not a member or banned")
+		return
+	}
+
+	msgTbl := fmt.Sprintf("messages-%d", chatID)
+	rows, err := cc.s.db.Query(
+		fmt.Sprintf(`SELECT id, guid, author FROM %q WHERE id>? ORDER BY id ASC LIMIT ?`, msgTbl),
+		sinceMessageID,
+		int(limitRaw),
+	)
+	if err != nil {
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+	defer rows.Close()
+
+	type message struct {
+		id     int64
+		guid   int64
+		author []byte
+		blob   []byte
+	}
+
+	var msgs []message
+	for rows.Next() {
+		var m message
+		if err := rows.Scan(&m.id, &m.guid, &m.author); err != nil {
+			_ = cc.writeErr(reqID, "db error")
+			return
+		}
+		// Fetch blob from hybrid cache using chatID+guid key
+		key := fmt.Sprintf("%016x:%016x", chatID, m.guid)
+		blob, ok, err := cc.s.cache.Get(key)
+		if err != nil {
+			_ = cc.writeErr(reqID, "cache error")
+			return
+		}
+		if !ok {
+			continue
+		}
+		m.blob = blob
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
+	buf := &bytes.Buffer{}
+	binary.Write(buf, binary.BigEndian, uint32(len(msgs)))
+
+	for _, m := range msgs {
+		binary.Write(buf, binary.BigEndian, uint64(chatID))
+		binary.Write(buf, binary.BigEndian, uint64(m.id))
+		binary.Write(buf, binary.BigEndian, m.guid)
+		buf.Write(m.author)
+		binary.Write(buf, binary.BigEndian, uint32(len(m.blob)))
+		buf.Write(m.blob)
+	}
+
+	_ = cc.writeOK(reqID, buf.Bytes())
 }
 
 func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
@@ -1114,14 +1385,14 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
 	}
-	guid, err := rdU64(p, &off)
+	guid, err := rdI64(p, &off)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad message id")
+		_ = cc.writeErr(reqID, "bad guid")
 		return
 	}
 	blob, err := rdBlob(p, &off)
@@ -1149,7 +1420,8 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 		now, guid, cc.pub[:],
 	)
 	if err != nil {
-		_ = cc.writeErr(reqID, "db error")
+		log.Printf("ERROR: Failed to insert message into %s: %v (guid=%d, author=%x)", msgTbl, err, guid, cc.pub[:4])
+		_ = cc.writeErr(reqID, "db error - failed to insert message")
 		return
 	}
 
@@ -1162,14 +1434,14 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 
 	id, _ := res.LastInsertId()
 	// After message successfully inserted:
-	// Broadcast payload: [chat_id(u64)][msg_id(u64)][guid(u64)][author(32)][blob_len(u32)][blob]
+	// Broadcast payload: [chat_id(i64)][msg_id(i64)][guid(i64)][author(32)][blob_len(u32)][blob]
 	out := make([]byte, 8+8+8+32+4+len(blob))
 	off2 := 0
-	binary.BigEndian.PutUint64(out[off2:off2+8], chatID)
+	binary.BigEndian.PutUint64(out[off2:off2+8], uint64(chatID))
 	off2 += 8
 	binary.BigEndian.PutUint64(out[off2:off2+8], uint64(id))
 	off2 += 8
-	binary.BigEndian.PutUint64(out[off2:off2+8], guid)
+	binary.BigEndian.PutUint64(out[off2:off2+8], uint64(guid))
 	off2 += 8
 	copy(out[off2:off2+32], cc.pub[:])
 	off2 += 32
@@ -1192,12 +1464,12 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
 	}
-	msgID, err := rdU64(p, &off)
+	msgID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad message id")
 		return
@@ -1216,69 +1488,13 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 	_ = cc.writeOK(reqID, nil)
 }
 
-func (cc *clientConn) handleGetMessage(reqID uint16, p []byte) {
-	off := 0
-	if !cc.authed {
-		_ = cc.writeErr(reqID, "auth required")
-		return
-	}
-	chatID, err := rdU64(p, &off)
-	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
-		return
-	}
-	msgID, err := rdU64(p, &off)
-	if err != nil {
-		_ = cc.writeErr(reqID, "bad message id")
-		return
-	}
-	_, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
-	if !ok || banned {
-		_ = cc.writeErr(reqID, "not a member or banned")
-		return
-	}
-
-	msgTbl := fmt.Sprintf("messages-%d", chatID)
-	var id int64
-	var ts int64
-	var guid uint64
-	var author []byte
-	// Look up GUID for this message in DB
-	err = cc.s.db.QueryRow(fmt.Sprintf(`SELECT id, ts, guid, author FROM %q WHERE id=?`, msgTbl), msgID).
-		Scan(&id, &ts, &guid, &author)
-	if err != nil {
-		_ = cc.writeErr(reqID, "not found")
-		return
-	}
-
-	key := fmt.Sprintf("%016x:%016x", chatID, guid)
-	blob, ok, err := cc.s.cache.Get(key)
-	if err != nil {
-		_ = cc.writeErr(reqID, "cache error")
-		return
-	}
-	if !ok {
-		_ = cc.writeErr(reqID, "message expired")
-		return
-	}
-
-	// response: [message_id(u64)][guid(u64)][pubkey(32)][blob_len(u32)][blob]
-	out := make([]byte, 8+4+8+32+4+len(blob))
-	binary.BigEndian.PutUint64(out[0:8], uint64(id))
-	binary.BigEndian.PutUint64(out[8:16], guid)
-	copy(out[16:], author)
-	binary.BigEndian.PutUint32(out[48:52], uint32(len(blob)))
-	copy(out[52:], blob)
-	_ = cc.writeOK(reqID, out)
-}
-
 func (cc *clientConn) handleGetLastMessageID(reqID uint16, p []byte) {
 	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -1301,14 +1517,14 @@ func (cc *clientConn) handleGetLastMessageID(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
-	// payload: to_pubkey(32), chat_id(u64), encrypted_data(blob)
+	// payload: to_pubkey(32), chat_id(i64), encrypted_data(blob)
 	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -1362,18 +1578,20 @@ func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
 	inviteID, _ := result.LastInsertId()
 	log.Printf("Invite created: from %x… to %x… for chat %d (id=%d)", cc.pub[:4], toPubkey[:4], chatID, inviteID)
 
-	// Check if recipient is currently connected and authenticated
+	// Check if recipient is currently connected and authenticated (multi-device support)
 	var toPubArr [32]byte
 	copy(toPubArr[:], toPubkey)
 
 	cc.s.authClientsMu.RLock()
-	recipientConn, isConnected := cc.s.authenticatedClients[toPubArr]
+	recipientConns := cc.s.authenticatedClients[toPubArr]
 	cc.s.authClientsMu.RUnlock()
 
-	if isConnected {
-		// Recipient is connected, send invite immediately
-		log.Printf("Recipient %x is connected, sending invite immediately", toPubArr[:4])
-		go cc.s.sendInviteToClient(recipientConn, inviteID, now, cc.pub[:], chatID, encryptedData)
+	if len(recipientConns) > 0 {
+		// Recipient is connected on one or more devices, send invite to all
+		log.Printf("Recipient %x is connected on %d device(s), sending invite to all", toPubArr[:4], len(recipientConns))
+		for recipientConn := range recipientConns {
+			go cc.s.sendInviteToClient(recipientConn, inviteID, now, cc.pub[:], chatID, encryptedData)
+		}
 	} else {
 		log.Printf("Recipient %x not connected, invite stored for later delivery", toPubArr[:4])
 	}
@@ -1382,7 +1600,7 @@ func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
-	// payload: invite_id(u64), accepted(u8)
+	// payload: invite_id(i64), accepted(u8)
 	// accepted: 0 = reject, 1 = accept
 	off := 0
 	if !cc.authed {
@@ -1390,7 +1608,7 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 		return
 	}
 
-	inviteID, err := rdU64(p, &off)
+	inviteID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad invite id")
 		return
@@ -1408,7 +1626,7 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 	}
 
 	// Look up the invite
-	var chatID uint64
+	var chatID int64
 	var fromPubkey []byte
 	var toPubkey []byte
 	err = cc.s.db.QueryRow(`SELECT chat_id, from_pubkey, to_pubkey FROM invites WHERE id=?`, inviteID).
@@ -1438,9 +1656,23 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 		_, err = cc.s.db.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info)
             VALUES(?,?,?,?,?,0,?)
             ON CONFLICT(pubkey) DO UPDATE SET banned=0, perms_flags=excluded.perms_flags`, usersTbl),
-			cc.pub[:], "", permUser, now, now, nil)
+			cc.pub[:], "", permUser, now, 0, nil)
 		if err != nil {
 			log.Printf("Failed to add user to chat %d: %v", chatID, err)
+			_ = cc.writeErr(reqID, "db error")
+			return
+		}
+
+		// System message: user added by inviter (include 32-byte random tail)
+		// Format: [event_code(1)][target_user(32)][actor(32)][random(32)]
+		body := make([]byte, 1+32+32+32)
+		body[0] = sysUserAdded
+		copy(body[1:33], cc.pub[:])
+		copy(body[33:65], fromPubkey)
+		copy(body[65:97], rand32())
+
+		if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+			log.Printf("ERROR: %v", err)
 			_ = cc.writeErr(reqID, "db error")
 			return
 		}
@@ -1479,14 +1711,14 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
-	// payload: chat_id(u64), timestamp(u64), encrypted_blob(blob)
+	// payload: chat_id(i64), timestamp(u64), encrypted_blob(blob)
 	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -1540,14 +1772,14 @@ func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleGetMembersInfo(reqID uint16, p []byte) {
-	// payload: chat_id(u64), timestamp(u64)
+	// payload: chat_id(i64), timestamp(u64)
 	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -1565,19 +1797,11 @@ func (cc *clientConn) handleGetMembersInfo(reqID uint16, p []byte) {
 		return
 	}
 
-	// Query all members with info (optionally filtered by timestamp)
+	// Query ALL non-banned members, returning full info only if changed since timestamp
+	// This gives client a consistent view of membership + selective info updates
 	usersTbl := fmt.Sprintf("users-%d", chatID)
-	var rows *sql.Rows
-	if sinceTimestamp > 0 {
-		// Only return members updated after the given timestamp
-		rows, err = cc.s.db.Query(fmt.Sprintf(
-			`SELECT pubkey, info, changed_at FROM %q WHERE info IS NOT NULL AND changed_at > ?`, usersTbl),
-			sinceTimestamp)
-	} else {
-		// Return all members with info
-		rows, err = cc.s.db.Query(fmt.Sprintf(
-			`SELECT pubkey, info, changed_at FROM %q WHERE info IS NOT NULL`, usersTbl))
-	}
+	rows, err := cc.s.db.Query(fmt.Sprintf(
+		`SELECT pubkey, info, changed_at FROM %q WHERE banned = 0`, usersTbl))
 
 	if err != nil {
 		log.Printf("Failed to query members info for chat %d: %v", chatID, err)
@@ -1589,16 +1813,26 @@ func (cc *clientConn) handleGetMembersInfo(reqID uint16, p []byte) {
 	// Collect member info
 	type memberInfo struct {
 		pubkey    []byte
-		info      []byte
+		info      []byte // nil if no info OR if not changed since timestamp
 		timestamp int64
 	}
 	var members []memberInfo
 
 	for rows.Next() {
 		var m memberInfo
-		if err := rows.Scan(&m.pubkey, &m.info, &m.timestamp); err != nil {
+		var infoBytes []byte
+		var changedAt int64
+		if err := rows.Scan(&m.pubkey, &infoBytes, &changedAt); err != nil {
 			continue
 		}
+
+		// Only include info if it's non-null AND (timestamp=0 OR changed after timestamp)
+		if infoBytes != nil && (sinceTimestamp == 0 || uint64(changedAt) > sinceTimestamp) {
+			m.info = infoBytes
+		} else {
+			m.info = nil // Signal to client: no update needed
+		}
+		m.timestamp = changedAt
 		members = append(members, m)
 	}
 
@@ -1636,7 +1870,8 @@ func (cc *clientConn) handleGetMembersInfo(reqID uint16, p []byte) {
 	_ = cc.writeOK(reqID, payload)
 }
 
-// handleGetMembers returns the list of all non-banned members' pubkeys for a chat
+// handleGetMembers returns the list of all non-banned members with pubkey, permissions, and online state
+// Response format: [count(u32)][[pubkey(32)][perms(1)][online(1)] repeated]
 func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 	off := 0
 	if !cc.authed {
@@ -1644,7 +1879,7 @@ func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 		return
 	}
 
-	chatID, err := rdU64(p, &off)
+	chatID, err := rdI64(p, &off)
 	if err != nil {
 		_ = cc.writeErr(reqID, "bad chat id")
 		return
@@ -1657,37 +1892,75 @@ func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 	}
 
 	usersTbl := fmt.Sprintf("users-%d", chatID)
-	rows, err := cc.s.db.Query(fmt.Sprintf(`SELECT pubkey FROM %q WHERE banned=0`, usersTbl))
+	rows, err := cc.s.db.Query(fmt.Sprintf(`SELECT pubkey, perms_flags FROM %q WHERE banned=0`, usersTbl))
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
 		return
 	}
 	defer rows.Close()
 
-	var members [][]byte
+	type member struct {
+		pubkey [32]byte
+		perms  byte
+		online byte
+	}
+	var members []member
+
 	for rows.Next() {
 		var pk []byte
-		if err := rows.Scan(&pk); err != nil {
+		var perms int64
+		if err := rows.Scan(&pk, &perms); err != nil {
 			continue
 		}
-		if len(pk) == 32 {
-			members = append(members, append([]byte(nil), pk...))
+		if len(pk) != 32 {
+			continue
 		}
+
+		var m member
+		copy(m.pubkey[:], pk)
+		m.perms = byte(perms)
+
+		// Check online state: look up if this pubkey has any connections subscribed to this chat
+		m.online = 0
+		var pkArr [32]byte
+		copy(pkArr[:], pk)
+
+		cc.s.authClientsMu.RLock()
+		clientConns := cc.s.authenticatedClients[pkArr]
+		cc.s.authClientsMu.RUnlock()
+
+		if len(clientConns) > 0 {
+			cc.s.chatMu.RLock()
+			chatSubs := cc.s.chatSubscriptions[chatID]
+			for conn := range clientConns {
+				if _, subscribed := chatSubs[conn]; subscribed {
+					m.online = 1
+					break
+				}
+			}
+			cc.s.chatMu.RUnlock()
+		}
+
+		members = append(members, m)
 	}
 
-	// Build response: [count(u32)][pubkey(32) repeated]
-	out := make([]byte, 4+32*len(members))
+	// Build response: [count(u32)][[pubkey(32)][perms(1)][online(1)] repeated]
+	out := make([]byte, 4+34*len(members))
 	binary.BigEndian.PutUint32(out[0:4], uint32(len(members)))
 	off2 := 4
 	for _, m := range members {
-		copy(out[off2:off2+32], m)
+		copy(out[off2:off2+32], m.pubkey[:])
 		off2 += 32
+		out[off2] = m.perms
+		off2 += 1
+		out[off2] = m.online
+		off2 += 1
 	}
 	_ = cc.writeOK(reqID, out)
 }
 
 // requestMemberInfo requests updated member info from the client for a specific chat
-func (cc *clientConn) requestMemberInfo(chatID uint64) {
+func (cc *clientConn) requestMemberInfo(chatID int64) {
 	// Get last update timestamp from database (if info exists)
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	var lastUpdate int64
@@ -1701,9 +1974,9 @@ func (cc *clientConn) requestMemberInfo(chatID uint64) {
 		lastUpdate = 0
 	}
 
-	// Build request payload: [chatID(u64)][lastUpdate(u64)]
+	// Build request payload: [chatID(i64)][lastUpdate(u64)]
 	payload := make([]byte, 16)
-	binary.BigEndian.PutUint64(payload[0:8], chatID)
+	binary.BigEndian.PutUint64(payload[0:8], uint64(chatID))
 	binary.BigEndian.PutUint64(payload[8:16], uint64(lastUpdate))
 
 	// Send request as a push notification (using cmdRequestMemberInfo as reqID)
@@ -1718,7 +1991,7 @@ func (cc *clientConn) requestMemberInfo(chatID uint64) {
 // ---------------- utilities ----------------
 
 // Subscribe the connection to a chat
-func (s *serverState) subscribe(chatID uint64, cc *clientConn) {
+func (s *serverState) subscribe(chatID int64, cc *clientConn) {
 	s.chatMu.Lock()
 	defer s.chatMu.Unlock()
 	set, ok := s.chatSubscriptions[chatID]
@@ -1741,20 +2014,27 @@ func (s *serverState) unsubscribeAll(cc *clientConn) {
 			}
 		}
 	}
-	cc.chats = make(map[uint64]struct{})
+	cc.chats = make(map[int64]struct{})
 	s.chatMu.Unlock()
 
-	// Remove from authenticated clients map if this client was authenticated
+	// Remove from authenticated clients map if this client was authenticated (multi-device support)
 	if cc.authed {
 		s.authClientsMu.Lock()
-		delete(s.authenticatedClients, cc.pub)
+		if conns, exists := s.authenticatedClients[cc.pub]; exists {
+			delete(conns, cc)
+			if len(conns) == 0 {
+				delete(s.authenticatedClients, cc.pub)
+				log.Printf("[DEBUG] Removed last device for user %x", cc.pub[:4])
+			} else {
+				log.Printf("[DEBUG] Removed device for user %x (%d remaining)", cc.pub[:4], len(conns))
+			}
+		}
 		s.authClientsMu.Unlock()
-		log.Printf("[DEBUG] Removed authenticated client %x from tracking", cc.pub[:4])
 	}
 }
 
 // Broadcast message to all subscribers of chatID except sender
-func (s *serverState) broadcastMessage(chatID uint64, sender *clientConn, msgPayload []byte) {
+func (s *serverState) broadcastMessage(chatID int64, sender *clientConn, msgPayload []byte) {
 	s.chatMu.RLock()
 	defer s.chatMu.RUnlock()
 	set, ok := s.chatSubscriptions[chatID]
@@ -1771,7 +2051,7 @@ func (s *serverState) broadcastMessage(chatID uint64, sender *clientConn, msgPay
 }
 
 // broadcastToChat sends a custom payload with the given requestId to all subscribers except sender
-func (s *serverState) broadcastToChat(chatID uint64, sender *clientConn, requestId uint16, payload []byte) {
+func (s *serverState) broadcastToChat(chatID int64, sender *clientConn, requestId uint16, payload []byte) {
 	s.chatMu.RLock()
 	defer s.chatMu.RUnlock()
 	set, ok := s.chatSubscriptions[chatID]
@@ -1788,7 +2068,7 @@ func (s *serverState) broadcastToChat(chatID uint64, sender *clientConn, request
 
 func hasAny(v byte, mask byte) bool { return (v & mask) != 0 }
 
-func (cc *clientConn) lookupPerms(chatID uint64, pub []byte) (role byte, banned bool, ok bool) {
+func (cc *clientConn) lookupPerms(chatID int64, pub []byte) (role byte, banned bool, ok bool) {
 	// Verify user membership & perms
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	var perms int64
@@ -1815,7 +2095,7 @@ func equalBytes(a, b []byte) bool {
 // ---------------- invite delivery ----------------
 
 // sendInviteToClient sends an invite notification to a connected client
-func (s *serverState) sendInviteToClient(cc *clientConn, inviteID int64, timestamp int64, fromPubkey []byte, chatID uint64, encryptedData []byte) bool {
+func (s *serverState) sendInviteToClient(cc *clientConn, inviteID int64, timestamp int64, fromPubkey []byte, chatID int64, encryptedData []byte) bool {
 	// Get chat metadata
 	var chatName, chatDesc string
 	var chatAvatar []byte
@@ -1844,7 +2124,7 @@ func (s *serverState) sendInviteToClient(cc *clientConn, inviteID int64, timesta
 	off += 8
 
 	// chat_id
-	binary.BigEndian.PutUint64(payload[off:], chatID)
+	binary.BigEndian.PutUint64(payload[off:], uint64(chatID))
 	off += 8
 
 	// from_pubkey
@@ -1910,7 +2190,7 @@ func (s *serverState) sendPendingInvites(cc *clientConn) {
 		id            int64
 		timestamp     int64
 		fromPubkey    []byte
-		chatID        uint64
+		chatID        int64
 		encryptedData []byte
 	}
 
