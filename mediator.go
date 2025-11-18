@@ -2,7 +2,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -34,41 +33,29 @@ import (
 )
 
 /*
-Networking overview (client protocol, similar feel to tracker.go):
+Networking overview (TLV-based client protocol):
 
-- First byte on connection: 0x00 = client protocol selector (protoClient).
-- After that, each request is a frame:
-    [version:1=0x01][cmd:1][len:4 big-endian][payload:len]
-- Server replies:
-    [status:1 (0=OK,1=ERR)][len:4][payload]
+- Connection initialization: [version:1=0x01][protoType:1=0x00]
+  Version is sent ONCE at connection start, not per-frame.
 
-Common binary atoms:
-- pubkey: 32 bytes
-- signature: 64 bytes
-- u64/u32/u16: big-endian
-- string: [u16 len][bytes...]
-- blob: [u32 len][bytes...]
+- Request frame format:
+    [cmd:1][reqId:2 big-endian][len:4 big-endian][TLV-payload:len]
 
-Commands (cmd codes):
- 0x01 GET_NONCE(pubkey) -> OK: nonce(32)
- 0x02 AUTH(pubkey, nonce(32), signature(64)) -> OK
- 0x10 CREATE_CHAT(owner_pubkey(32), nonce(32), counter(4), signature(64),
-                  name(string<=20), description(string<=200), avatar(blob<=200KB))
-         -> OK: chat_id(u64)
-         (signature is over nonce||counter, must satisfy sig[0]==0 && sig[1]==0)
- 0x11 DELETE_CHAT(chat_id(u64), owner_pubkey, nonce(string), signature(64)) -> OK: 1 byte (0/1)
- 0x20 ADD_USER(chat_id(u64), user_pubkey(32)) -> OK
- 0x21 DELETE_USER(chat_id(u64), user_pubkey(32)) -> OK
- 0x30 SEND_MESSAGE(chat_id(u64), blob) -> OK: message_id(u64)
- 0x31 DELETE_MESSAGE(chat_id(u64), message_id(u64)) -> OK
- 0x32 GET_MESSAGE(chat_id(u64), message_id(u64)) -> OK: [message_id(u64)][blob]
- 0x33 GET_LAST_MESSAGE_ID(chat_id(u64)) -> OK: last_id(u64)
+- Response frame format:
+    [status:1 (0=OK,1=ERR)][reqId:2][len:4][TLV-payload:len]
+
+- TLV encoding format:
+    [tag:1][length:varint 1-4 bytes][value:length]
+
+  Varint encoding (Protocol Buffers style):
+    - 7 bits data + 1 bit continuation flag per byte
+    - Max 4 bytes = 28 bits = up to 268MB
+    - Little-endian order
 
 Authorization:
 - GET_NONCE, AUTH: always allowed.
-- CREATE_CHAT, DELETE_CHAT: per-parameter nonce/signature (not connection auth strictly required, but typically you will be AUTHed anyway).
-- ADD_USER, DELETE_USER, SEND_MESSAGE, DELETE_MESSAGE, GET_MESSAGE, GET_LAST_MESSAGE_ID:
-    require authenticated connection; we check the caller's pubkey membership & perms in users-{id}.
+- CREATE_CHAT, DELETE_CHAT: per-parameter nonce/signature.
+- Other commands: require authenticated connection; we check the caller's pubkey membership & perms.
 
 Permissions (perms_flags bitmask):
 - 0x80 owner
@@ -76,21 +63,17 @@ Permissions (perms_flags bitmask):
 - 0x20 moderator
 - 0x10 user
 - 0x08 read-only user
-- 0x01 banned  (in users-{id} a separate "banned" column exists as well; this bit is maintained too)
+- 0x01 banned
 
-Extra schema:
-- global table "nonces(pubkey BLOB(32), nonce TEXT, ts INTEGER, PRIMARY KEY(pubkey))"
+Schema:
+- global table "nonces(pubkey BLOB(32), nonce BLOB(32), ts INTEGER, PRIMARY KEY(pubkey))"
 - global table "chats(id INTEGER PRIMARY KEY, owner_pubkey BLOB(32), created_at INTEGER NOT NULL)"
-- settings-{id}(name, description, avatar, perms_flags, created_at, extra JSON)
-    - users-{id}(pubkey, nickname, text_rank, perms_flags, accepted_at, changed_at, banned)
-- messages-{id}(id INTEGER PK AUTOINCREMENT, ts, blob, author)
+- global table "invites(...)"
+- Per-chat tables: settings-{id}, users-{id}, messages-{id}
 
 Signature rules:
-- Ed25519 signature must verify against message = nonce (as bytes of the UTF-8 string)
-- Additional constraint: signature’s first 16 bits are zero (sig[0]==0 && sig[1]==0).
-
-Note:
-- Nonces are stored; you said daily purge, so no TTL enforced here.
+- Ed25519 signature must verify against nonce||counter
+- Additional constraint: signature's first 16 bits are zero (sig[0]==0 && sig[1]==0).
 */
 
 const (
@@ -288,15 +271,20 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 	defer c.Close()
 	log.Printf("[DEBUG] New client connection from %x", c.Public[:])
 
-	// protocol discriminator (like in tracker)
-	var disc [1]byte
-	if _, err := io.ReadFull(c.Stream, disc[:]); err != nil {
-		log.Printf("[DEBUG] Failed to read protocol discriminator: %v", err)
+	// Connection initialization: [version:1][protoType:1]
+	var init [2]byte
+	if _, err := io.ReadFull(c.Stream, init[:]); err != nil {
+		log.Printf("[DEBUG] Failed to read connection init: %v", err)
 		return
 	}
-	log.Printf("[DEBUG] Protocol discriminator: 0x%02x (expected 0x%02x)", disc[0], protoClient)
-	if disc[0] != protoClient {
-		log.Printf("[DEBUG] Invalid protocol discriminator, closing connection")
+	log.Printf("[DEBUG] Connection init: version=0x%02x (expected 0x%02x), protoType=0x%02x (expected 0x%02x)",
+		init[0], version, init[1], protoClient)
+	if init[0] != version {
+		log.Printf("[DEBUG] Invalid version, closing connection")
+		return
+	}
+	if init[1] != protoClient {
+		log.Printf("[DEBUG] Invalid protocol type, closing connection")
 		return
 	}
 
@@ -309,30 +297,27 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 			log.Printf("[DEBUG] Failed to set read deadline: %v", err)
 			return
 		}
-		// Frame: [ver][cmd][len u32][payload]
-		var hdr [8]byte
+		// Frame: [cmd:1][reqId:2][len:4][TLV-payload]
+		var hdr [7]byte
 		if _, err := io.ReadFull(c.Stream, hdr[:]); err != nil {
 			log.Printf("[DEBUG] Failed to read frame header: %v", err)
 			return
 		}
-		if hdr[0] != version {
-			log.Printf("[DEBUG] Bad version: got 0x%02x, expected 0x%02x", hdr[0], version)
-			_ = cc.writeErr(0, "bad version")
-			return
-		}
-		cmd := hdr[1]
-		reqId := binary.BigEndian.Uint16(hdr[2:4])
-		plen := binary.BigEndian.Uint32(hdr[4:8])
+		cmd := hdr[0]
+		reqId := binary.BigEndian.Uint16(hdr[1:3])
+		plen := binary.BigEndian.Uint32(hdr[3:7])
 		log.Printf("[DEBUG] Received command: 0x%02x, reqId=%d, payloadLen=%d", cmd, reqId, plen)
 		if plen > (32 << 20) { // 32MB sanity
 			log.Printf("[DEBUG] Payload too large: %d bytes", plen)
-			_ = cc.writeErr(0, "payload too large")
+			_ = cc.writeErr(reqId, "payload too large")
 			return
 		}
 		payload := make([]byte, plen)
-		if _, err := io.ReadFull(c.Stream, payload); err != nil {
-			log.Printf("[DEBUG] Failed to read payload: %v", err)
-			return
+		if plen > 0 {
+			if _, err := io.ReadFull(c.Stream, payload); err != nil {
+				log.Printf("[DEBUG] Failed to read payload: %v", err)
+				return
+			}
 		}
 
 		switch cmd {
@@ -375,7 +360,7 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 		case cmdGetMembers:
 			cc.handleGetMembers(reqId, payload)
 		default:
-			_ = cc.writeErr(0, "unknown cmd")
+			_ = cc.writeErr(reqId, "unknown cmd")
 			return
 		}
 	}
@@ -680,17 +665,21 @@ func rdBlob(b []byte, off *int) ([]byte, error) {
 // ---------------- command handlers ----------------
 
 func (cc *clientConn) handleGetNonce(reqID uint16, p []byte) {
-	// payload: pubkey(32)
-	off := 0
-	raw, err := rdBytes(p, &off, 32)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad pubkey")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	var pk [32]byte
-	copy(pk[:], raw)
 
-	// generate random 32-byte nonce
+	// Extract pubkey from TLV
+	pk, err := tlvGetBytes(tlvs, TAG_PUBKEY, 32)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid pubkey")
+		return
+	}
+
+	// Generate random 32-byte nonce
 	var nonce [32]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		_ = cc.writeErr(reqID, "rng failure")
@@ -701,41 +690,56 @@ func (cc *clientConn) handleGetNonce(reqID uint16, p []byte) {
 	_, err = cc.s.db.Exec(`INSERT INTO nonces(pubkey, nonce, ts)
 		VALUES(?,?,?)
 		ON CONFLICT(pubkey) DO UPDATE SET nonce=excluded.nonce, ts=excluded.ts`,
-		pk[:], nonce[:], now)
+		pk, nonce[:], now)
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
 		return
 	}
 
-	// response: nonce(32)
-	if err := cc.writeOK(reqID, nonce[:]); err != nil {
+	// Build TLV response with nonce
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		return tlvEncodeBytes(w, TAG_NONCE, nonce[:])
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
+	}
+
+	if err := cc.writeOK(reqID, resp); err != nil {
 		log.Printf("[DEBUG] handleGetNonce: writeOK failed: %v", err)
 		return
 	}
 }
 
 func (cc *clientConn) handleAuth(reqID uint16, p []byte) {
-	// payload: pubkey(32), nonce(32), signature(64)
-	off := 0
-	rawpk, err := rdBytes(p, &off, 32)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad pubkey")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	nonce, err := rdBytes(p, &off, 32)
+
+	// Extract fields
+	rawpk, err := tlvGetBytes(tlvs, TAG_PUBKEY, 32)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad nonce")
+		_ = cc.writeErr(reqID, "missing or invalid pubkey")
 		return
 	}
-	sig, err := rdBytes(p, &off, 64)
+	nonce, err := tlvGetBytes(tlvs, TAG_NONCE, 32)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad signature")
+		_ = cc.writeErr(reqID, "missing or invalid nonce")
 		return
 	}
+	sig, err := tlvGetBytes(tlvs, TAG_SIGNATURE, 64)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid signature")
+		return
+	}
+
 	var pk [32]byte
 	copy(pk[:], rawpk)
 
-	// check nonce exists
+	// Check nonce exists
 	var dbNonce []byte
 	err = cc.s.db.QueryRow(`SELECT nonce FROM nonces WHERE pubkey = ?`, pk[:]).Scan(&dbNonce)
 	if err != nil || !equalBytes(dbNonce, nonce) {
@@ -766,7 +770,7 @@ func (cc *clientConn) handleAuth(reqID uint16, p []byte) {
 	cc.s.authClientsMu.Unlock()
 	log.Printf("[DEBUG] Registered device for user %x (total devices: %d)", pk[:4], deviceCount)
 
-	// Send OK response first
+	// Send OK response (empty TLV payload)
 	_ = cc.writeOK(reqID, nil)
 
 	// Check for and send any pending invites after successful authentication
@@ -779,19 +783,22 @@ func (cc *clientConn) handlePing(reqID uint16) {
 }
 
 func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
-	// payload: owner_pubkey(32), nonce(32), counter(4),
-	// signature(64) over (nonce||counter),
-	// name(str<=20), description(str<=200), avatar(blob<=200k)
-
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "not authenticated")
 		return
 	}
 
-	rawpk, err := rdBytes(p, &off, 32)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad owner pubkey")
+		_ = cc.writeErr(reqID, "bad tlv payload")
+		return
+	}
+
+	// Extract fields
+	rawpk, err := tlvGetBytes(tlvs, TAG_PUBKEY, 32)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid owner pubkey")
 		return
 	}
 	if !equalBytes(rawpk, cc.pub[:]) {
@@ -799,36 +806,33 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 		return
 	}
 
-	nonce, err := rdBytes(p, &off, 32)
+	nonce, err := tlvGetBytes(tlvs, TAG_NONCE, 32)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad nonce")
+		_ = cc.writeErr(reqID, "missing or invalid nonce")
 		return
 	}
-	counter, err := rdBytes(p, &off, 4)
+	counter, err := tlvGetBytes(tlvs, TAG_COUNTER, 4)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad counter")
+		_ = cc.writeErr(reqID, "missing or invalid counter")
 		return
 	}
-	sig, err := rdBytes(p, &off, 64)
+	sig, err := tlvGetBytes(tlvs, TAG_SIGNATURE, 64)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad signature")
+		_ = cc.writeErr(reqID, "missing or invalid signature")
 		return
 	}
-	name, err := rdStr(p, &off)
+	name, err := tlvGetString(tlvs, TAG_CHAT_NAME)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad name")
+		_ = cc.writeErr(reqID, "missing chat name")
 		return
 	}
-	desc, err := rdStr(p, &off)
+	desc, err := tlvGetString(tlvs, TAG_CHAT_DESC)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad description")
+		_ = cc.writeErr(reqID, "missing chat description")
 		return
 	}
-	avatar, err := rdBlob(p, &off)
-	if err != nil {
-		_ = cc.writeErr(reqID, "bad avatar")
-		return
-	}
+	avatar := tlvGetBytesOptional(tlvs, TAG_CHAT_AVATAR)
+
 	if len(name) > maxNameLen || len(desc) > maxDescLen || len(avatar) > maxAvatarBytes {
 		_ = cc.writeErr(reqID, "field too large")
 		return
@@ -906,7 +910,7 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 	// insert owner in users with owner bit; not banned
 	if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info)
         VALUES(?,?,?,?,?,0,?)`, users),
-		owner[:], "", permOwner|permUser, now, now, nil); err != nil {
+		owner[:], "", permOwner|permUser, now, 0, nil); err != nil {
 		_ = cc.writeErr(reqID, "db owner")
 		return
 	}
@@ -916,18 +920,28 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 		return
 	}
 
-	// response: chat_id(i64)
-	resp := make([]byte, 8)
-	binary.BigEndian.PutUint64(resp, uint64(chatID))
+	// Build TLV response with chat_id
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		return tlvEncodeI64(w, TAG_CHAT_ID, chatID)
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
+	}
 	_ = cc.writeOK(reqID, resp)
 }
 
 func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
-	// payload: chat_id(i64), owner_pubkey(32), nonce(str), signature(64)
-	off := 0
-	chatID, err := rdI64(p, &off)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
+		return
+	}
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
 
@@ -1021,20 +1035,26 @@ func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
-	// requires cc.authed true and perms: owner/admin/mod
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	newUser, err := rdBytes(p, &off, 32)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad new user pubkey")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
+		return
+	}
+	newUser, err := tlvGetBytes(tlvs, TAG_USER_PUBKEY, 32)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid user pubkey")
 		return
 	}
 
@@ -1077,20 +1097,26 @@ func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
-	off := 0
-	// "delete" = set banned bit in perms_flags and banned=1
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	userPK, err := rdBytes(p, &off, 32)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad user pubkey")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
+		return
+	}
+	userPK, err := tlvGetBytes(tlvs, TAG_USER_PUBKEY, 32)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid user pubkey")
 		return
 	}
 
@@ -1131,13 +1157,20 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 
 func (cc *clientConn) handleGetUserChats(reqID uint16, p []byte) {
 	if !cc.authed {
-		_ = cc.writeErr(0, "auth required")
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+
+	// Parse TLV payload (empty for this command)
+	_, err := parseTLVs(p)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
 
 	rows, err := cc.s.db.Query(`SELECT id FROM chats`)
 	if err != nil {
-		_ = cc.writeErr(0, "db error")
+		_ = cc.writeErr(reqID, "db error")
 		return
 	}
 	defer rows.Close()
@@ -1168,11 +1201,21 @@ func (cc *clientConn) handleGetUserChats(reqID uint16, p []byte) {
 		chatIDs = append(chatIDs, id)
 	}
 
-	// Encode result
-	resp := make([]byte, 4+len(chatIDs)*8)
-	binary.BigEndian.PutUint32(resp[0:4], uint32(len(chatIDs)))
-	for i, id := range chatIDs {
-		binary.BigEndian.PutUint64(resp[4+i*8:], uint64(id))
+	// Build TLV response with count + repeated chat IDs
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeU32(w, TAG_COUNT, uint32(len(chatIDs))); err != nil {
+			return err
+		}
+		for _, id := range chatIDs {
+			if err := tlvEncodeI64(w, TAG_CHAT_ID, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
 	}
 
 	_ = cc.writeOK(reqID, resp)
@@ -1180,13 +1223,20 @@ func (cc *clientConn) handleGetUserChats(reqID uint16, p []byte) {
 
 func (cc *clientConn) handleLeaveChat(reqID uint16, p []byte) {
 	if !cc.authed {
-		_ = cc.writeErr(0, "auth required")
+		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	off := 0
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(0, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
+		return
+	}
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
 
@@ -1242,14 +1292,21 @@ func (cc *clientConn) handleLeaveChat(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleSubscribe(reqID uint16, p []byte) {
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
+		return
+	}
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
 	log.Printf("Searching for chatId %d permissions", chatID)
@@ -1275,37 +1332,47 @@ func (cc *clientConn) handleSubscribe(reqID uint16, p []byte) {
 
 	cc.s.subscribe(chatID, cc)
 
-	// Return OK with last_message_id in payload
-	out := make([]byte, 8)
-	binary.BigEndian.PutUint64(out, uint64(lastID.Int64))
-	_ = cc.writeOK(reqID, out)
+	// Build TLV response with last_message_id
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		return tlvEncodeU64(w, TAG_MESSAGE_ID, uint64(lastID.Int64))
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
+	}
+	_ = cc.writeOK(reqID, resp)
 
 	// Request member info update from client
 	go cc.requestMemberInfo(chatID)
 }
 
 // handleGetMessagesSince fetches multiple messages in a single request
-// Request: [chatId(i64)][sinceMessageId(i64)][limit(u32)]
-// Response: [count(u32)][[chatId(i64)][msgId(i64)][guid(u64)][author(32)][blobLen(u32)][blob]...]
 func (cc *clientConn) handleGetMessagesSince(reqID uint16, p []byte) {
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	sinceMessageID, err := rdI64(p, &off)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad message id")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
-	limitRaw, err := rdU32(p, &off)
+	sinceMessageID, err := tlvGetI64(tlvs, TAG_SINCE_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad limit")
+		_ = cc.writeErr(reqID, "missing or invalid since message id")
+		return
+	}
+	limitRaw, err := tlvGetU32(tlvs, TAG_LIMIT)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid limit")
 		return
 	}
 	if limitRaw == 0 || limitRaw > 500 {
@@ -1364,41 +1431,61 @@ func (cc *clientConn) handleGetMessagesSince(reqID uint16, p []byte) {
 		return
 	}
 
-	buf := &bytes.Buffer{}
-	binary.Write(buf, binary.BigEndian, uint32(len(msgs)))
-
-	for _, m := range msgs {
-		binary.Write(buf, binary.BigEndian, uint64(chatID))
-		binary.Write(buf, binary.BigEndian, uint64(m.id))
-		binary.Write(buf, binary.BigEndian, m.guid)
-		buf.Write(m.author)
-		binary.Write(buf, binary.BigEndian, uint32(len(m.blob)))
-		buf.Write(m.blob)
+	// Build TLV response with count + repeated message structures
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeU32(w, TAG_COUNT, uint32(len(msgs))); err != nil {
+			return err
+		}
+		for _, m := range msgs {
+			if err := tlvEncodeI64(w, TAG_MESSAGE_ID, m.id); err != nil {
+				return err
+			}
+			if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, m.guid); err != nil {
+				return err
+			}
+			if err := tlvEncodeBytes(w, TAG_PUBKEY, m.author); err != nil {
+				return err
+			}
+			if err := tlvEncodeBytes(w, TAG_MESSAGE_BLOB, m.blob); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
 	}
 
-	_ = cc.writeOK(reqID, buf.Bytes())
+	_ = cc.writeOK(reqID, resp)
 }
 
 func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	guid, err := rdI64(p, &off)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad guid")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
-	blob, err := rdBlob(p, &off)
+	guid, err := tlvGetI64(tlvs, TAG_MESSAGE_GUID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad blob")
+		_ = cc.writeErr(reqID, "missing or invalid guid")
 		return
+	}
+	blob := tlvGetBytesOptional(tlvs, TAG_MESSAGE_BLOB)
+	if blob == nil {
+		blob = []byte{} // Empty message allowed
 	}
 
 	role, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
@@ -1425,53 +1512,73 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 		return
 	}
 
-	// Store (author||blob) in hybrid cache for short-term retention
-	// Layout: [author(32)][blob]
+	// Store blob in hybrid cache for short-term retention
 	key := fmt.Sprintf("%016x:%016x", chatID, guid)
 	if err := cc.s.cache.Set(key, blob, 24*time.Hour); err != nil {
 		log.Printf("cache set failed: %v", err)
 	}
 
 	id, _ := res.LastInsertId()
-	// After message successfully inserted:
-	// Broadcast payload: [chat_id(i64)][msg_id(i64)][guid(i64)][author(32)][blob_len(u32)][blob]
-	out := make([]byte, 8+8+8+32+4+len(blob))
-	off2 := 0
-	binary.BigEndian.PutUint64(out[off2:off2+8], uint64(chatID))
-	off2 += 8
-	binary.BigEndian.PutUint64(out[off2:off2+8], uint64(id))
-	off2 += 8
-	binary.BigEndian.PutUint64(out[off2:off2+8], uint64(guid))
-	off2 += 8
-	copy(out[off2:off2+32], cc.pub[:])
-	off2 += 32
-	binary.BigEndian.PutUint32(out[off2:off2+4], uint32(len(blob)))
-	off2 += 4
-	copy(out[off2:], blob)
 
-	// notify others
-	cc.s.broadcastMessage(chatID, cc, out)
+	// Build TLV broadcast payload for cmdGotMessage
+	broadcastPayload, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeI64(w, TAG_CHAT_ID, chatID); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_MESSAGE_ID, id); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_PUBKEY, cc.pub[:]); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_MESSAGE_BLOB, blob); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("ERROR: Failed to encode broadcast payload: %v", err)
+		// Continue anyway, respond to sender
+	} else {
+		// Notify others
+		cc.s.broadcastMessage(chatID, cc, broadcastPayload)
+	}
 
-	// and respond to sender
-	out2 := make([]byte, 8)
-	binary.BigEndian.PutUint64(out2, uint64(id))
-	_ = cc.writeOK(reqID, out2)
+	// Build TLV response with message_id
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		return tlvEncodeI64(w, TAG_MESSAGE_ID, id)
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
+	}
+	_ = cc.writeOK(reqID, resp)
 }
 
 func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	msgID, err := rdI64(p, &off)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad message id")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
+		return
+	}
+	msgID, err := tlvGetI64(tlvs, TAG_MESSAGE_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid message id")
 		return
 	}
 	role, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
@@ -1489,16 +1596,24 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleGetLastMessageID(reqID uint16, p []byte) {
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
-	chatID, err := rdI64(p, &off)
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
+		return
+	}
+
 	_, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
 	if !ok || banned {
 		_ = cc.writeErr(reqID, "not a member or banned")
@@ -1511,33 +1626,44 @@ func (cc *clientConn) handleGetLastMessageID(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "db error")
 		return
 	}
-	out := make([]byte, 8)
-	binary.BigEndian.PutUint64(out, uint64(lastID.Int64))
-	_ = cc.writeOK(reqID, out)
+
+	// Build TLV response with last message ID
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		return tlvEncodeU64(w, TAG_MESSAGE_ID, uint64(lastID.Int64))
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
+	}
+	_ = cc.writeOK(reqID, resp)
 }
 
 func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
-	// payload: to_pubkey(32), chat_id(i64), encrypted_data(blob)
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	chatID, err := rdI64(p, &off)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	toPubkey, err := rdBytes(p, &off, 32)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad to_pubkey")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
-	encryptedData, err := rdBlob(p, &off)
+	toPubkey, err := tlvGetBytes(tlvs, TAG_USER_PUBKEY, 32)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad encrypted data")
+		_ = cc.writeErr(reqID, "missing or invalid to_pubkey")
 		return
+	}
+	encryptedData := tlvGetBytesOptional(tlvs, TAG_INVITE_DATA)
+	if encryptedData == nil {
+		encryptedData = []byte{} // Empty invite data allowed
 	}
 
 	log.Printf("Searching for chatId %d permissions", chatID)
@@ -1600,25 +1726,28 @@ func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
-	// payload: invite_id(i64), accepted(u8)
-	// accepted: 0 = reject, 1 = accept
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	inviteID, err := rdI64(p, &off)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad invite id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	if off+1 > len(p) {
-		_ = cc.writeErr(reqID, "bad accepted flag")
+
+	inviteID, err := tlvGetI64(tlvs, TAG_INVITE_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid invite id")
 		return
 	}
-	accepted := p[off]
-	off += 1
+	accepted, err := tlvGetU8(tlvs, TAG_ACCEPTED)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid accepted flag")
+		return
+	}
 
 	if accepted != 0 && accepted != 1 {
 		_ = cc.writeErr(reqID, "invalid accepted value")
@@ -1711,27 +1840,31 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
-	// payload: chat_id(i64), timestamp(u64), encrypted_blob(blob)
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	chatID, err := rdI64(p, &off)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	timestamp, err := rdU64(p, &off)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad timestamp")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
-	encryptedBlob, err := rdBlob(p, &off)
+	timestamp, err := tlvGetU64(tlvs, TAG_TIMESTAMP)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad encrypted blob")
+		_ = cc.writeErr(reqID, "missing or invalid timestamp")
 		return
+	}
+	encryptedBlob := tlvGetBytesOptional(tlvs, TAG_MEMBER_INFO)
+	if encryptedBlob == nil {
+		encryptedBlob = []byte{} // Empty member info allowed
 	}
 
 	// Verify user is a member of the chat
@@ -1751,20 +1884,30 @@ func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
 		return
 	}
 
-	// Broadcast updated member info to subscribers (excluding sender) in the same
-	// format as handleGetMembersInfo: [count(u32)][pubkey(32)][infoLen(u32)][info][timestamp(u64)]
-	payload := make([]byte, 4+32+4+len(encryptedBlob)+8)
-	off2 := 0
-	binary.BigEndian.PutUint32(payload[off2:off2+4], 1)
-	off2 += 4
-	copy(payload[off2:off2+32], cc.pub[:])
-	off2 += 32
-	binary.BigEndian.PutUint32(payload[off2:off2+4], uint32(len(encryptedBlob)))
-	off2 += 4
-	copy(payload[off2:off2+len(encryptedBlob)], encryptedBlob)
-	off2 += len(encryptedBlob)
-	binary.BigEndian.PutUint64(payload[off2:off2+8], timestamp)
-	go cc.s.broadcastToChat(chatID, cc, cmdGotMemberInfo, payload)
+	// Build TLV broadcast payload for cmdGotMemberInfo
+	broadcastPayload, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeI64(w, TAG_CHAT_ID, chatID); err != nil {
+			return err
+		}
+		if err := tlvEncodeU32(w, TAG_COUNT, 1); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_USER_PUBKEY, cc.pub[:]); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_MEMBER_INFO, encryptedBlob); err != nil {
+			return err
+		}
+		if err := tlvEncodeU64(w, TAG_TIMESTAMP, timestamp); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("Failed to encode member info broadcast: %v", err)
+	} else {
+		go cc.s.broadcastToChat(chatID, cc, cmdGotMemberInfo, broadcastPayload)
+	}
 
 	log.Printf("Updated member info for %x in chat %d (size=%d bytes)",
 		cc.pub[:4], chatID, len(encryptedBlob))
@@ -1772,22 +1915,27 @@ func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
 }
 
 func (cc *clientConn) handleGetMembersInfo(reqID uint16, p []byte) {
-	// payload: chat_id(i64), timestamp(u64)
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	chatID, err := rdI64(p, &off)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
 		return
 	}
-	sinceTimestamp, err := rdU64(p, &off)
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad timestamp")
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
+	}
+	sinceTimestamp, err := tlvGetU64(tlvs, TAG_LAST_UPDATE)
+	if err != nil {
+		// TAG_LAST_UPDATE is optional, default to 0
+		sinceTimestamp = 0
 	}
 
 	// Verify user is a member of the chat
@@ -1836,52 +1984,57 @@ func (cc *clientConn) handleGetMembersInfo(reqID uint16, p []byte) {
 		members = append(members, m)
 	}
 
-	// Build response: [count(u32)][[pubkey(32)][infoLen(u32)][encryptedInfo][timestamp(u64)]...]
-	payloadSize := 4 // count
-	for _, m := range members {
-		payloadSize += 32 + 4 + len(m.info) + 8
-	}
-
-	payload := make([]byte, payloadSize)
-	offset := 0
-
-	// Write count
-	binary.BigEndian.PutUint32(payload[offset:], uint32(len(members)))
-	offset += 4
-
-	// Write each member's info
-	for _, m := range members {
-		// pubkey (32 bytes)
-		copy(payload[offset:], m.pubkey)
-		offset += 32
-
-		// info length + data
-		binary.BigEndian.PutUint32(payload[offset:], uint32(len(m.info)))
-		offset += 4
-		copy(payload[offset:], m.info)
-		offset += len(m.info)
-
-		// timestamp
-		binary.BigEndian.PutUint64(payload[offset:], uint64(m.timestamp))
-		offset += 8
+	// Build TLV response with count + repeated member structures
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeU32(w, TAG_COUNT, uint32(len(members))); err != nil {
+			return err
+		}
+		for _, m := range members {
+			if err := tlvEncodeBytes(w, TAG_USER_PUBKEY, m.pubkey); err != nil {
+				return err
+			}
+			if m.info != nil {
+				if err := tlvEncodeBytes(w, TAG_MEMBER_INFO, m.info); err != nil {
+					return err
+				}
+			} else {
+				// Empty member info indicates no update
+				if err := tlvEncodeBytes(w, TAG_MEMBER_INFO, []byte{}); err != nil {
+					return err
+				}
+			}
+			if err := tlvEncodeU64(w, TAG_TIMESTAMP, uint64(m.timestamp)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
 	}
 
 	log.Printf("Sending %d member(s) info for chat %d to %x", len(members), chatID, cc.pub[:4])
-	_ = cc.writeOK(reqID, payload)
+	_ = cc.writeOK(reqID, resp)
 }
 
 // handleGetMembers returns the list of all non-banned members with pubkey, permissions, and online state
-// Response format: [count(u32)][[pubkey(32)][perms(1)][online(1)] repeated]
 func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
-	off := 0
 	if !cc.authed {
 		_ = cc.writeErr(reqID, "auth required")
 		return
 	}
 
-	chatID, err := rdI64(p, &off)
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
 	if err != nil {
-		_ = cc.writeErr(reqID, "bad chat id")
+		_ = cc.writeErr(reqID, "bad tlv payload")
+		return
+	}
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
 
@@ -1944,19 +2097,29 @@ func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 		members = append(members, m)
 	}
 
-	// Build response: [count(u32)][[pubkey(32)][perms(1)][online(1)] repeated]
-	out := make([]byte, 4+34*len(members))
-	binary.BigEndian.PutUint32(out[0:4], uint32(len(members)))
-	off2 := 4
-	for _, m := range members {
-		copy(out[off2:off2+32], m.pubkey[:])
-		off2 += 32
-		out[off2] = m.perms
-		off2 += 1
-		out[off2] = m.online
-		off2 += 1
+	// Build TLV response with count + repeated member structures
+	resp, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeU32(w, TAG_COUNT, uint32(len(members))); err != nil {
+			return err
+		}
+		for _, m := range members {
+			if err := tlvEncodeBytes(w, TAG_USER_PUBKEY, m.pubkey[:]); err != nil {
+				return err
+			}
+			if err := tlvEncodeU8(w, TAG_PERMS, m.perms); err != nil {
+				return err
+			}
+			if err := tlvEncodeU8(w, TAG_ONLINE, m.online); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		_ = cc.writeErr(reqID, "tlv encode error")
+		return
 	}
-	_ = cc.writeOK(reqID, out)
+	_ = cc.writeOK(reqID, resp)
 }
 
 // requestMemberInfo requests updated member info from the client for a specific chat
@@ -1974,10 +2137,20 @@ func (cc *clientConn) requestMemberInfo(chatID int64) {
 		lastUpdate = 0
 	}
 
-	// Build request payload: [chatID(i64)][lastUpdate(u64)]
-	payload := make([]byte, 16)
-	binary.BigEndian.PutUint64(payload[0:8], uint64(chatID))
-	binary.BigEndian.PutUint64(payload[8:16], uint64(lastUpdate))
+	// Build TLV payload for cmdRequestMemberInfo push
+	payload, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeI64(w, TAG_CHAT_ID, chatID); err != nil {
+			return err
+		}
+		if err := tlvEncodeU64(w, TAG_LAST_UPDATE, uint64(lastUpdate)); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("Failed to encode member info request: %v", err)
+		return
+	}
 
 	// Send request as a push notification (using cmdRequestMemberInfo as reqID)
 	if err := cc.writeOK(cmdRequestMemberInfo, payload); err != nil {
@@ -2107,58 +2280,42 @@ func (s *serverState) sendInviteToClient(cc *clientConn, inviteID int64, timesta
 		return false
 	}
 
-	// Build payload: inviteId(8), chat_id(8), from_pubkey(32), timestamp(8),
-	// chat_name(str), chat_desc(str), chat_avatar(blob), encrypted_data(blob)
-	// Must match Android client format in MediatorClient.kt line 606
-	payloadSize := 8 + 8 + 32 + 8 +
-		2 + len(chatName) +
-		2 + len(chatDesc) +
-		4 + len(chatAvatar) +
-		4 + len(encryptedData)
+	// Build TLV payload for cmdGotInvite push
+	payload, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeI64(w, TAG_INVITE_ID, inviteID); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_CHAT_ID, chatID); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_PUBKEY, fromPubkey); err != nil {
+			return err
+		}
+		if err := tlvEncodeU64(w, TAG_TIMESTAMP, uint64(timestamp)); err != nil {
+			return err
+		}
+		if err := tlvEncodeString(w, TAG_CHAT_NAME, chatName); err != nil {
+			return err
+		}
+		if err := tlvEncodeString(w, TAG_CHAT_DESC, chatDesc); err != nil {
+			return err
+		}
+		if chatAvatar != nil {
+			if err := tlvEncodeBytes(w, TAG_CHAT_AVATAR, chatAvatar); err != nil {
+				return err
+			}
+		}
+		if err := tlvEncodeBytes(w, TAG_INVITE_DATA, encryptedData); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("Failed to encode invite notification: %v", err)
+		return false
+	}
 
-	payload := make([]byte, payloadSize)
-	off := 0
-
-	// invite_id
-	binary.BigEndian.PutUint64(payload[off:], uint64(inviteID))
-	off += 8
-
-	// chat_id
-	binary.BigEndian.PutUint64(payload[off:], uint64(chatID))
-	off += 8
-
-	// from_pubkey
-	copy(payload[off:], fromPubkey)
-	off += 32
-
-	// timestamp
-	binary.BigEndian.PutUint64(payload[off:], uint64(timestamp))
-	off += 8
-
-	// chat_name (string)
-	binary.BigEndian.PutUint16(payload[off:], uint16(len(chatName)))
-	off += 2
-	copy(payload[off:], chatName)
-	off += len(chatName)
-
-	// chat_desc (string)
-	binary.BigEndian.PutUint16(payload[off:], uint16(len(chatDesc)))
-	off += 2
-	copy(payload[off:], chatDesc)
-	off += len(chatDesc)
-
-	// chat_avatar (blob)
-	binary.BigEndian.PutUint32(payload[off:], uint32(len(chatAvatar)))
-	off += 4
-	copy(payload[off:], chatAvatar)
-	off += len(chatAvatar)
-
-	// encrypted_data (blob)
-	binary.BigEndian.PutUint32(payload[off:], uint32(len(encryptedData)))
-	off += 4
-	copy(payload[off:], encryptedData)
-
-	// Send as notification using cmdGotInvite with reqID=0
+	// Send as notification using cmdGotInvite
 	if err := cc.writeOK(cmdGotInvite, payload); err != nil {
 		log.Printf("Failed to send invite notification to %x: %v", cc.pub[:4], err)
 		return false
