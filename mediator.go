@@ -146,6 +146,7 @@ type serverState struct {
 	chatMu            sync.RWMutex
 	chatSubscriptions map[int64]map[*clientConn]struct{}
 	cache             *hybridcache.HybridCache
+	cacheTTL          time.Duration // configurable message cache retention period
 	// authenticated clients tracking: pubkey → set of client connections (multi-device support)
 	authClientsMu        sync.RWMutex
 	authenticatedClients map[[32]byte]map[*clientConn]struct{}
@@ -162,11 +163,13 @@ type clientConn struct {
 
 func main() {
 	var peers []string
+	var cacheDays int
 	fs := flag.NewFlagSet("mediator", flag.ExitOnError)
-	fs.Func("peer", "bootstrap Ygg peers (can be given multiple times)", func(s string) error {
+	fs.Func("peer", "Yggdrasil peers to connect to (can be given multiple times)", func(s string) error {
 		peers = append(peers, s)
 		return nil
 	})
+	fs.IntVar(&cacheDays, "cache-days", 1, "Number of days to cache messages")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
@@ -229,6 +232,7 @@ func main() {
 		pub:                  pub,
 		chatSubscriptions:    make(map[int64]map[*clientConn]struct{}),
 		cache:                cache,
+		cacheTTL:             time.Duration(cacheDays) * 24 * time.Hour,
 		authenticatedClients: make(map[[32]byte]map[*clientConn]struct{}),
 	}
 
@@ -502,7 +506,7 @@ func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *
 
 		// Store body in cache
 		key := fmt.Sprintf("%016x:%016x", chatID, guid)
-		if err := s.cache.Set(key, body, 24*time.Hour); err != nil {
+		if err := s.cache.Set(key, body, s.cacheTTL); err != nil {
 			log.Printf("cache set failed for system message: %v", err)
 		}
 	}
@@ -1514,7 +1518,7 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 
 	// Store blob in hybrid cache for short-term retention
 	key := fmt.Sprintf("%016x:%016x", chatID, guid)
-	if err := cc.s.cache.Set(key, blob, 24*time.Hour); err != nil {
+	if err := cc.s.cache.Set(key, blob, cc.s.cacheTTL); err != nil {
 		log.Printf("cache set failed: %v", err)
 	}
 

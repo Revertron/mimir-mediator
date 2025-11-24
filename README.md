@@ -36,7 +36,7 @@ go mod init mediator
 go get modernc.org/sqlite
 go get github.com/Revertron/yggquic
 go get github.com/yggdrasil-network/yggdrasil-go/src/core
-go build -o mediator mediator.go
+go build -o mediator mediator.go tlv.go
 ```
 You’ll end up with a binary named `mediator`.
 
