@@ -933,6 +933,10 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 		return
 	}
 	_ = cc.writeOK(reqID, resp)
+
+	// Request member info from the owner immediately after chat creation
+	// This ensures the owner's profile (nickname, avatar) is available to other members
+	go cc.requestMemberInfo(chatID)
 }
 
 func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
@@ -1804,7 +1808,7 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 		copy(body[33:65], fromPubkey)
 		copy(body[65:97], rand32())
 
-		if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+		if _, err := cc.s.broadcastSystemMessage(chatID, body, nil, true); err != nil {
 			log.Printf("ERROR: %v", err)
 			_ = cc.writeErr(reqID, "db error")
 			return
