@@ -933,10 +933,6 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 		return
 	}
 	_ = cc.writeOK(reqID, resp)
-
-	// Request member info from the owner immediately after chat creation
-	// This ensures the owner's profile (nickname, avatar) is available to other members
-	go cc.requestMemberInfo(chatID)
 }
 
 func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
