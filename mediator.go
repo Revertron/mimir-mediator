@@ -1818,12 +1818,6 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 			return
 		}
 
-		// Request member info from client (with timestamp 0 to get all)
-		// Find the client connection for this user and request info
-		// For now, if they're already connected on this same conn, send immediately
-		// Otherwise they'll be asked when they subscribe
-		go cc.requestMemberInfo(chatID)
-
 		log.Printf("Added %x to chat %d members, requesting member info", cc.pub[:4], chatID)
 
 	} else {
