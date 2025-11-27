@@ -511,25 +511,33 @@ func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *
 		}
 	}
 
-	// Broadcast as regular message: [chat_id(i64)][msg_id(i64)][guid(i64)][author(32)][blob_len(u32)][blob]
-	push := make([]byte, 8+8+8+32+4+len(body))
-	off := 0
-	binary.BigEndian.PutUint64(push[off:off+8], uint64(chatID))
-	off += 8
-	binary.BigEndian.PutUint64(push[off:off+8], uint64(msgID))
-	off += 8
-	binary.BigEndian.PutUint64(push[off:off+8], uint64(guid))
-	off += 8
-	copy(push[off:off+32], s.pub[:])
-	off += 32
-	binary.BigEndian.PutUint32(push[off:off+4], uint32(len(body)))
-	off += 4
-	copy(push[off:], body)
+	// Build TLV broadcast payload for cmdGotMessage
+	broadcastPayload, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeI64(w, TAG_CHAT_ID, chatID); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_MESSAGE_ID, msgID); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_PUBKEY, s.pub); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_MESSAGE_BLOB, body); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode system message broadcast: %w", err)
+	}
 
 	if sender != nil {
-		go s.broadcastMessage(chatID, sender, push)
+		go s.broadcastMessage(chatID, sender, broadcastPayload)
 	} else {
-		go s.broadcastToChat(chatID, nil, cmdGotMessage, push)
+		go s.broadcastToChat(chatID, nil, cmdGotMessage, broadcastPayload)
 	}
 
 	return msgID, nil
