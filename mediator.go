@@ -1914,7 +1914,7 @@ func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
 	if err != nil {
 		log.Printf("Failed to encode member info broadcast: %v", err)
 	} else {
-		go cc.s.broadcastToChat(chatID, cc, cmdGotMemberInfo, broadcastPayload)
+		go cc.s.broadcastToChat(chatID, nil, cmdGotMemberInfo, broadcastPayload)
 	}
 
 	log.Printf("Updated member info for %x in chat %d (size=%d bytes)",
