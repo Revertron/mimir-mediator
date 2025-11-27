@@ -487,9 +487,8 @@ func rand32() []byte {
 // broadcastSystemMessage creates, stores, and broadcasts a system message
 // If storeInDB is false, only broadcasts without database storage (e.g., for chat deletion)
 // Returns the message ID (0 if not stored) and any error
-func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *clientConn, storeInDB bool) (int64, error) {
-	now := time.Now().Unix()
-	guid := generateMessageGuid(now, body)
+func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *clientConn, timestamp int64, storeInDB bool) (int64, error) {
+	guid := generateMessageGuid(timestamp, body)
 
 	var msgID int64
 	if storeInDB {
@@ -497,7 +496,7 @@ func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *
 		msgTbl := fmt.Sprintf("messages-%d", chatID)
 		res, err := s.db.Exec(
 			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
-			now, guid, s.pub,
+			timestamp, guid, s.pub,
 		)
 		if err != nil {
 			return 0, fmt.Errorf("failed to insert system message: %w", err)
@@ -520,6 +519,9 @@ func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *
 			return err
 		}
 		if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_TIMESTAMP, timestamp); err != nil {
 			return err
 		}
 		if err := tlvEncodeBytes(w, TAG_PUBKEY, s.pub); err != nil {
@@ -1099,7 +1101,7 @@ func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
 	copy(body[33:65], cc.pub[:])
 	copy(body[65:97], rand32())
 
-	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
 		log.Printf("ERROR: %v", err)
 		_ = cc.writeErr(reqID, "db error")
 		return
@@ -1158,7 +1160,7 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 	copy(body[33:65], cc.pub[:])
 	copy(body[65:97], rand32())
 
-	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
 		log.Printf("ERROR: %v", err)
 		_ = cc.writeErr(reqID, "db error")
 		return
@@ -1287,7 +1289,8 @@ func (cc *clientConn) handleLeaveChat(reqID uint16, p []byte) {
 	copy(body[1:33], cc.pub[:])
 	copy(body[33:65], rand32())
 
-	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, true); err != nil {
+	now := time.Now().Unix()
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
 		log.Printf("ERROR: %v", err)
 		_ = cc.writeErr(reqID, "db error")
 		return
@@ -1401,7 +1404,7 @@ func (cc *clientConn) handleGetMessagesSince(reqID uint16, p []byte) {
 
 	msgTbl := fmt.Sprintf("messages-%d", chatID)
 	rows, err := cc.s.db.Query(
-		fmt.Sprintf(`SELECT id, guid, author FROM %q WHERE id>? ORDER BY id ASC LIMIT ?`, msgTbl),
+		fmt.Sprintf(`SELECT id, guid, ts, author FROM %q WHERE id>? ORDER BY id ASC LIMIT ?`, msgTbl),
 		sinceMessageID,
 		int(limitRaw),
 	)
@@ -1412,16 +1415,17 @@ func (cc *clientConn) handleGetMessagesSince(reqID uint16, p []byte) {
 	defer rows.Close()
 
 	type message struct {
-		id     int64
-		guid   int64
-		author []byte
-		blob   []byte
+		id        int64
+		guid      int64
+		timestamp int64
+		author    []byte
+		blob      []byte
 	}
 
 	var msgs []message
 	for rows.Next() {
 		var m message
-		if err := rows.Scan(&m.id, &m.guid, &m.author); err != nil {
+		if err := rows.Scan(&m.id, &m.guid, &m.timestamp, &m.author); err != nil {
 			_ = cc.writeErr(reqID, "db error")
 			return
 		}
@@ -1453,6 +1457,9 @@ func (cc *clientConn) handleGetMessagesSince(reqID uint16, p []byte) {
 				return err
 			}
 			if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, m.guid); err != nil {
+				return err
+			}
+			if err := tlvEncodeI64(w, TAG_TIMESTAMP, m.timestamp); err != nil {
 				return err
 			}
 			if err := tlvEncodeBytes(w, TAG_PUBKEY, m.author); err != nil {
@@ -1541,6 +1548,9 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 			return err
 		}
 		if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_TIMESTAMP, now); err != nil {
 			return err
 		}
 		if err := tlvEncodeBytes(w, TAG_PUBKEY, cc.pub[:]); err != nil {
@@ -1812,7 +1822,7 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 		copy(body[33:65], fromPubkey)
 		copy(body[65:97], rand32())
 
-		if _, err := cc.s.broadcastSystemMessage(chatID, body, nil, true); err != nil {
+		if _, err := cc.s.broadcastSystemMessage(chatID, body, nil, now, true); err != nil {
 			log.Printf("ERROR: %v", err)
 			_ = cc.writeErr(reqID, "db error")
 			return
