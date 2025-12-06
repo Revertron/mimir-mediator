@@ -1,0 +1,25 @@
+# Go build artifacts
+/mediator
+/mediator.exe
+*.exe
+*.test
+*.out
+/bin/
+/coverage.out
+
+# Runtime data (generated at first run)
+/mediator.db
+/mediator.db-wal
+/mediator.db-shm
+/mediator.key
+/mediator-cache/
+
+# Logs
+*.log
+
+# Editors/OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

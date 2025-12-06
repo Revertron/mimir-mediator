@@ -23,6 +23,7 @@ import (
 	//"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"crypto/tls"
 
@@ -847,7 +848,8 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 	}
 	avatar := tlvGetBytesOptional(tlvs, TAG_CHAT_AVATAR)
 
-	if len(name) > maxNameLen || len(desc) > maxDescLen || len(avatar) > maxAvatarBytes {
+	// Count runes (characters) not bytes for proper UTF-8 validation
+	if utf8.RuneCountInString(name) > maxNameLen || utf8.RuneCountInString(desc) > maxDescLen || len(avatar) > maxAvatarBytes {
 		_ = cc.writeErr(reqID, "field too large")
 		return
 	}
