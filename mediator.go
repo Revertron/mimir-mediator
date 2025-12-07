@@ -137,21 +137,25 @@ const (
 )
 
 type serverState struct {
-	db        *sql.DB
-	node      *core.Core
-	transport *yggquic.YggdrasilTransport
-	priv      ed25519.PrivateKey
-	pub       ed25519.PublicKey
-	authMu    sync.Mutex
-	// chatSubscriptions: chatID → set of client connections
-	chatMu            sync.RWMutex
-	chatSubscriptions map[int64]map[*clientConn]struct{}
-	cache             *hybridcache.HybridCache
-	cacheTTL          time.Duration // configurable message cache retention period
-	// authenticated clients tracking: pubkey → set of client connections (multi-device support)
-	authClientsMu        sync.RWMutex
-	authenticatedClients map[[32]byte]map[*clientConn]struct{}
+    db        *sql.DB
+    node      *core.Core
+    transport *yggquic.YggdrasilTransport
+    priv      ed25519.PrivateKey
+    pub       ed25519.PublicKey
+    authMu    sync.Mutex
+    // chatSubscriptions: chatID → set of client connections
+    chatMu            sync.RWMutex
+    chatSubscriptions map[int64]map[*clientConn]struct{}
+    cache             *hybridcache.HybridCache
+    cacheTTL          time.Duration // configurable message cache retention period
+    // authenticated clients tracking: pubkey → set of client connections (multi-device support)
+    authClientsMu        sync.RWMutex
+    authenticatedClients map[[32]byte]map[*clientConn]struct{}
+    // address-based connection tracking: (pubkey+addr) → clientConn for deduplication
+    // uses authClientsMu for synchronization
+    addrConnMap map[string]*clientConn // key: "pubkey:address"
 }
+
 
 // connection-scoped state
 type clientConn struct {
@@ -160,6 +164,11 @@ type clientConn struct {
 	authed bool
 	pub    [32]byte
 	chats  map[int64]struct{} // chats this client subscribed to
+}
+
+// getAddrKey returns a unique key for pubkey+address combination
+func getAddrKey(pubkey [32]byte, addr string) string {
+    return fmt.Sprintf("%x:%s", pubkey, addr)
 }
 
 func main() {
@@ -225,7 +234,7 @@ func main() {
 	}
 	defer cache.Close()
 
-	st := &serverState{
+    st := &serverState{
 		db:                   db,
 		node:                 node,
 		transport:            m.GetTransport(),
@@ -235,7 +244,8 @@ func main() {
 		cache:                cache,
 		cacheTTL:             time.Duration(cacheDays) * 24 * time.Hour,
 		authenticatedClients: make(map[[32]byte]map[*clientConn]struct{}),
-	}
+		addrConnMap:          make(map[string]*clientConn), // ADD THIS LINE
+    }
 
 	log.Printf("mediator started; pubkey: %x", pub[:])
 	log.Printf("listening for client requests…")
@@ -775,15 +785,42 @@ func (cc *clientConn) handleAuth(reqID uint16, p []byte) {
 	cc.authed = true
 	cc.pub = pk
 
-	// Register this client as authenticated (multi-device support)
-	cc.s.authClientsMu.Lock()
-	if cc.s.authenticatedClients[pk] == nil {
-		cc.s.authenticatedClients[pk] = make(map[*clientConn]struct{})
-	}
-	cc.s.authenticatedClients[pk][cc] = struct{}{}
-	deviceCount := len(cc.s.authenticatedClients[pk])
-	cc.s.authClientsMu.Unlock()
-	log.Printf("[DEBUG] Registered device for user %x (total devices: %d)", pk[:4], deviceCount)
+    // Register this client as authenticated (multi-device support)
+    // Also implement address-based deduplication: kill old connection from same address
+    addr := cc.conn.Stream.RemoteAddr().String()
+    addrKey := getAddrKey(pk, addr)
+
+    cc.s.authClientsMu.Lock()
+
+    // Check if there's an existing connection from the same pubkey+address
+    if oldConn, exists := cc.s.addrConnMap[addrKey]; exists {
+        log.Printf("[DEBUG] Found duplicate connection from %s for user %x, closing old connection", addr, pk[:4])
+
+        // Remove old connection from authenticatedClients
+        if conns, ok := cc.s.authenticatedClients[pk]; ok {
+                delete(conns, oldConn)
+        }
+
+        // Remove from addrConnMap
+        delete(cc.s.addrConnMap, addrKey)
+
+        // Close the old connection (will trigger unsubscribeAll via defer)
+        go oldConn.conn.Close()
+    }
+
+    // Register new connection
+    if cc.s.authenticatedClients[pk] == nil {
+        cc.s.authenticatedClients[pk] = make(map[*clientConn]struct{})
+    }
+    cc.s.authenticatedClients[pk][cc] = struct{}{}
+    cc.s.addrConnMap[addrKey] = cc
+
+    deviceCount := len(cc.s.authenticatedClients[pk])
+    uniqueAddresses := len(cc.s.addrConnMap)
+    cc.s.authClientsMu.Unlock()
+
+    log.Printf("[DEBUG] Registered device for user %x from %s (total devices: %d, unique addresses: %d)",
+        pk[:4], addr, deviceCount, uniqueAddresses)
 
 	// Send OK response (empty TLV payload)
 	_ = cc.writeOK(reqID, nil)
@@ -2196,32 +2233,44 @@ func (s *serverState) subscribe(chatID int64, cc *clientConn) {
 
 // Unsubscribe the connection from all chats (called on disconnect)
 func (s *serverState) unsubscribeAll(cc *clientConn) {
-	s.chatMu.Lock()
-	for chatID := range cc.chats {
-		if set, ok := s.chatSubscriptions[chatID]; ok {
-			delete(set, cc)
-			if len(set) == 0 {
-				delete(s.chatSubscriptions, chatID)
-			}
-		}
-	}
-	cc.chats = make(map[int64]struct{})
-	s.chatMu.Unlock()
+    s.chatMu.Lock()
+    for chatID := range cc.chats {
+            if set, ok := s.chatSubscriptions[chatID]; ok {
+                    delete(set, cc)
+                    if len(set) == 0 {
+                            delete(s.chatSubscriptions, chatID)
+                    }
+            }
+    }
+    cc.chats = make(map[int64]struct{})
+    s.chatMu.Unlock()
 
-	// Remove from authenticated clients map if this client was authenticated (multi-device support)
-	if cc.authed {
-		s.authClientsMu.Lock()
-		if conns, exists := s.authenticatedClients[cc.pub]; exists {
-			delete(conns, cc)
-			if len(conns) == 0 {
-				delete(s.authenticatedClients, cc.pub)
-				log.Printf("[DEBUG] Removed last device for user %x", cc.pub[:4])
-			} else {
-				log.Printf("[DEBUG] Removed device for user %x (%d remaining)", cc.pub[:4], len(conns))
-			}
-		}
-		s.authClientsMu.Unlock()
-	}
+    // Remove from authenticated clients map if this client was authenticated (multi-device support)
+    if cc.authed {
+            addr := cc.conn.Stream.RemoteAddr().String()
+            addrKey := getAddrKey(cc.pub, addr)
+
+            s.authClientsMu.Lock()
+
+            // Remove from addrConnMap (only if it's still this connection)
+            if storedConn, exists := s.addrConnMap[addrKey]; exists && storedConn == cc {
+                    delete(s.addrConnMap, addrKey)
+                    log.Printf("[DEBUG] Removed address mapping for user %x from %s", cc.pub[:4], addr)
+            }
+
+            // Remove from authenticatedClients
+            if conns, exists := s.authenticatedClients[cc.pub]; exists {
+                    delete(conns, cc)
+                    if len(conns) == 0 {
+                            delete(s.authenticatedClients, cc.pub)
+                            log.Printf("[DEBUG] Removed last device for user %x", cc.pub[:4])
+                    } else {
+                            log.Printf("[DEBUG] Removed device for user %x (%d remaining)", cc.pub[:4], len(conns))
+                    }
+            }
+
+            s.authClientsMu.Unlock()
+    }
 }
 
 // Broadcast message to all subscribers of chatID except sender
