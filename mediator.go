@@ -219,10 +219,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Configure connection pool for SQLite
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;`); err != nil {
 		log.Fatal(err)
 	}
@@ -1646,12 +1642,28 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "missing or invalid message id")
 		return
 	}
-	role, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
-	if !ok || banned || !hasAny(role, permOwner|permAdmin|permMod) {
-		_ = cc.writeErr(reqID, "insufficient perms")
+
+	// Check if the user is the author of the message
+	msgTbl := fmt.Sprintf("messages-%d", chatID)
+	var author []byte
+	err = cc.s.db.QueryRow(fmt.Sprintf(`SELECT author FROM %q WHERE id=?`, msgTbl), msgID).Scan(&author)
+	if err != nil {
+		_ = cc.writeErr(reqID, "message not found")
 		return
 	}
-	msgTbl := fmt.Sprintf("messages-%d", chatID)
+
+	// Allow deletion if user is the author
+	isAuthor := len(author) == len(cc.pub) && string(author) == string(cc.pub[:])
+
+	// If not the author, check for admin/mod/owner permissions
+	if !isAuthor {
+		role, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
+		if !ok || banned || !hasAny(role, permOwner|permAdmin|permMod) {
+			_ = cc.writeErr(reqID, "insufficient perms")
+			return
+		}
+	}
+
 	_, err = cc.s.db.Exec(fmt.Sprintf(`DELETE FROM %q WHERE id=?`, msgTbl), msgID)
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
