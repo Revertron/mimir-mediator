@@ -127,6 +127,7 @@ const (
 	sysChatDeleted    = 0x05
 	sysChatInfoChange = 0x06
 	sysPermsChanged   = 0x07
+	sysMessageDeleted = 0x08
 
 	maxNameLen       = 20
 	maxDescLen       = 200
@@ -1637,16 +1638,16 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 		_ = cc.writeErr(reqID, "missing or invalid chat id")
 		return
 	}
-	msgID, err := tlvGetI64(tlvs, TAG_MESSAGE_ID)
+	guid, err := tlvGetI64(tlvs, TAG_MESSAGE_GUID)
 	if err != nil {
-		_ = cc.writeErr(reqID, "missing or invalid message id")
+		_ = cc.writeErr(reqID, "missing or invalid message guid")
 		return
 	}
 
 	// Check if the user is the author of the message
 	msgTbl := fmt.Sprintf("messages-%d", chatID)
 	var author []byte
-	err = cc.s.db.QueryRow(fmt.Sprintf(`SELECT author FROM %q WHERE id=?`, msgTbl), msgID).Scan(&author)
+	err = cc.s.db.QueryRow(fmt.Sprintf(`SELECT author FROM %q WHERE guid=?`, msgTbl), guid).Scan(&author)
 	if err != nil {
 		_ = cc.writeErr(reqID, "message not found")
 		return
@@ -1664,11 +1665,26 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 		}
 	}
 
-	_, err = cc.s.db.Exec(fmt.Sprintf(`DELETE FROM %q WHERE id=?`, msgTbl), msgID)
+	_, err = cc.s.db.Exec(fmt.Sprintf(`DELETE FROM %q WHERE guid=?`, msgTbl), guid)
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
 		return
 	}
+
+	// Create system message to notify all users (including those who connect later)
+	// Format: [sysMessageDeleted(1)][deleted_guid(8)][deleter_pubkey(32)]
+	body := make([]byte, 41)
+	body[0] = sysMessageDeleted
+	binary.BigEndian.PutUint64(body[1:9], uint64(guid))
+	copy(body[9:41], cc.pub[:])
+
+	now := time.Now().Unix()
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
+		log.Printf("ERROR: failed to broadcast deletion system message: %v", err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
 	_ = cc.writeOK(reqID, nil)
 }
 
