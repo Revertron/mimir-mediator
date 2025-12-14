@@ -1667,7 +1667,7 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 
 	_, err = cc.s.db.Exec(fmt.Sprintf(`DELETE FROM %q WHERE guid=?`, msgTbl), guid)
 	if err != nil {
-		_ = cc.writeErr(reqID, "db error")
+		_ = cc.writeErr(reqID, fmt.Sprintf("db error: %v", err))
 		return
 	}
 
@@ -1681,7 +1681,7 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 	now := time.Now().Unix()
 	if _, err := cc.s.broadcastSystemMessage(chatID, body, nil, now, true); err != nil {
 		log.Printf("ERROR: failed to broadcast deletion system message: %v", err)
-		_ = cc.writeErr(reqID, "db error")
+		_ = cc.writeErr(reqID, "broadcast error")
 		return
 	}
 
