@@ -20,7 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	//"strings"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -1560,14 +1560,31 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 
 	msgTbl := fmt.Sprintf("messages-%d", chatID)
 	now := time.Now().Unix()
-	// Store only metadata (ts, guid, author)
-	res, err := cc.s.db.Exec(
-		fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
-		now, guid, cc.pub[:],
-	)
-	if err != nil {
+
+	// Retry loop for unique-guid collisions
+	const maxRetries = 10
+	var res sql.Result
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		res, err = cc.s.db.Exec(
+			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
+			now, guid, cc.pub[:],
+		)
+		if err == nil {
+			break // success
+		}
+		// If it's a UNIQUE-constraint failure on guid, increment and retry
+		if strings.Contains(err.Error(), "constraint failed: UNIQUE constraint failed") {
+			guid++ // simple increment; maybe the strategy will change in the future
+			continue
+		}
+		// Any other error is terminal
 		log.Printf("ERROR: Failed to insert message into %s: %v (guid=%d, author=%x)", msgTbl, err, guid, cc.pub[:4])
 		_ = cc.writeErr(reqID, fmt.Sprintf("db error - failed to insert message: %v", err))
+		return
+	}
+	if err != nil { // loop exhausted
+		log.Printf("ERROR: guid collision limit exceeded for chat %d", chatID)
+		_ = cc.writeErr(reqID, "db error - guid collision limit exceeded")
 		return
 	}
 
@@ -1611,6 +1628,9 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 
 	// Build TLV response with message_id
 	resp, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
+			return err
+		}
 		return tlvEncodeI64(w, TAG_MESSAGE_ID, id)
 	})
 	if err != nil {
