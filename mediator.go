@@ -1567,7 +1567,7 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 	)
 	if err != nil {
 		log.Printf("ERROR: Failed to insert message into %s: %v (guid=%d, author=%x)", msgTbl, err, guid, cc.pub[:4])
-		_ = cc.writeErr(reqID, "db error - failed to insert message")
+		_ = cc.writeErr(reqID, fmt.Sprintf("db error - failed to insert message: %v", err))
 		return
 	}
 
