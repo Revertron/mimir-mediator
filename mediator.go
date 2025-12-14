@@ -1679,7 +1679,7 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 	copy(body[9:41], cc.pub[:])
 
 	now := time.Now().Unix()
-	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, nil, now, true); err != nil {
 		log.Printf("ERROR: failed to broadcast deletion system message: %v", err)
 		_ = cc.writeErr(reqID, "db error")
 		return
