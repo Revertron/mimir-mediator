@@ -100,11 +100,12 @@ const (
 	cmdSendInvite        = 0x40
 	cmdGotInvite         = 0x41 // Server sends it to the client when delivering an invite.
 	cmdInviteResponse    = 0x42 // Client responds to invite (accept/reject)
-	cmdUpdateMemberInfo  = 0x50 // Client sends encrypted member info (nickname, info, avatar)
-	cmdRequestMemberInfo = 0x51 // Server requests member info from client
-	cmdGetMembersInfo    = 0x52 // Client requests all members info
-	cmdGetMembers        = 0x53 // Client requests all member pubkeys (lightweight)
-	cmdGotMemberInfo     = 0x54 // Server push: member info updated
+	cmdUpdateMemberInfo   = 0x50 // Client sends encrypted member info (nickname, info, avatar)
+	cmdRequestMemberInfo  = 0x51 // Server requests member info from client
+	cmdGetMembersInfo     = 0x52 // Client requests all members info
+	cmdGetMembers         = 0x53 // Client requests all member pubkeys (lightweight)
+	cmdGotMemberInfo      = 0x54 // Server push: member info updated
+	cmdChangeMemberStatus = 0x55 // Change member permissions (ban, promote, demote)
 
 	// response status
 	statusOK  = 0x00
@@ -129,7 +130,7 @@ const (
 	sysPermsChanged   = 0x07
 	sysMessageDeleted = 0x08
 
-	maxNameLen       = 20
+	maxNameLen       = 25
 	maxDescLen       = 200
 	maxAvatarBytes   = 200 * 1024
 	dbFile           = "mediator.db"
@@ -375,6 +376,8 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 			cc.handleGetMembersInfo(reqId, payload)
 		case cmdGetMembers:
 			cc.handleGetMembers(reqId, payload)
+		case cmdChangeMemberStatus:
+			cc.handleChangeMemberStatus(reqId, payload)
 		default:
 			_ = cc.writeErr(reqId, "unknown cmd")
 			return
@@ -1203,6 +1206,116 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
 		log.Printf("ERROR: %v", err)
 		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
+	_ = cc.writeOK(reqID, nil)
+}
+
+func (cc *clientConn) handleChangeMemberStatus(reqID uint16, p []byte) {
+	if !cc.authed {
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad tlv payload")
+		return
+	}
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
+		return
+	}
+	targetUserPK, err := tlvGetBytes(tlvs, TAG_USER_PUBKEY, 32)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid user pubkey")
+		return
+	}
+	newPerms, err := tlvGetU8(tlvs, TAG_PERMS)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid perms")
+		return
+	}
+
+	// Get caller's permissions
+	callerRole, callerBanned, ok := cc.lookupPerms(chatID, cc.pub[:])
+	if !ok || callerBanned {
+		_ = cc.writeErr(reqID, "not a member or banned")
+		return
+	}
+
+	// Check if caller is trying to modify themselves
+	if equalBytes(cc.pub[:], targetUserPK) {
+		_ = cc.writeErr(reqID, "cannot modify own permissions")
+		return
+	}
+
+	// Get target user's current permissions
+	targetRole, _, targetOK := cc.lookupPerms(chatID, targetUserPK)
+	if !targetOK {
+		_ = cc.writeErr(reqID, "target user not a member")
+		return
+	}
+
+	// Permission check based on caller's role
+	isOwner := (callerRole & permOwner) != 0
+	isAdmin := (callerRole & permAdmin) != 0
+
+	if !isOwner && !isAdmin {
+		// Moderators and regular users cannot change permissions
+		_ = cc.writeErr(reqID, "insufficient perms")
+		return
+	}
+
+	// Owner can modify anyone except themselves (already checked above)
+	// Admin cannot modify owner
+	if !isOwner && (targetRole&permOwner) != 0 {
+		_ = cc.writeErr(reqID, "cannot modify owner permissions")
+		return
+	}
+
+	// Validate new permissions (must have at least one permission bit set)
+	// Valid combinations: permUser, permAdmin|permUser, permMod|permUser, permReadOnly, permBanned
+	validPerms := newPerms&(permOwner|permAdmin|permMod|permUser|permReadOnly|permBanned) != 0
+	if !validPerms {
+		_ = cc.writeErr(reqID, "invalid permission flags")
+		return
+	}
+
+	// Update permissions in database
+	usersTbl := fmt.Sprintf("users-%d", chatID)
+	now := time.Now().Unix()
+
+	// If banning, set banned flag; otherwise clear it
+	var banned int64 = 0
+	if (newPerms & permBanned) != 0 {
+		banned = 1
+	}
+
+	_, err = cc.s.db.Exec(fmt.Sprintf(`UPDATE %q SET perms_flags=?, banned=?, changed_at=? WHERE pubkey=?`, usersTbl),
+		newPerms, banned, now, targetUserPK)
+	if err != nil {
+		log.Printf("ERROR updating member permissions: %v", err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
+	// System message: permissions changed
+	// Format: [event_code(1)][target_user(32)][new_perms(1)][actor(32)][random(32)]
+	body := make([]byte, 1+32+1+32+32)
+	body[0] = sysPermsChanged
+	copy(body[1:33], targetUserPK)
+	body[33] = newPerms
+	copy(body[34:66], cc.pub[:])
+	copy(body[66:98], rand32())
+
+	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
+		log.Printf("ERROR broadcasting permission change: %v", err)
+		_ = cc.writeErr(reqID, "broadcast error")
 		return
 	}
 
