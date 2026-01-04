@@ -1745,30 +1745,45 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 	msgTbl := fmt.Sprintf("messages-%d", chatID)
 	now := time.Now().Unix()
 
-	// Retry loop for unique-guid collisions
-	const maxRetries = 10
-	var res sql.Result
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		res, err = cc.s.db.Exec(
-			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
-			now, guid, cc.pub[:],
-		)
-		if err == nil {
-			break // success
-		}
-		// If it's a UNIQUE-constraint failure on guid, increment and retry
+	// Try to insert the message
+	res, err := cc.s.db.Exec(
+		fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
+		now, guid, cc.pub[:],
+	)
+	if err != nil {
+		// If it's a UNIQUE-constraint failure on guid, check if it's a duplicate
 		if strings.Contains(err.Error(), "constraint failed: UNIQUE constraint failed") {
-			guid++ // simple increment; maybe the strategy will change in the future
-			continue
+			// Get the existing message with this GUID (both ID and timestamp in one query)
+			var existingID int64
+			var existingTs int64
+			err := cc.s.db.QueryRow(
+				fmt.Sprintf(`SELECT id, ts FROM %q WHERE guid=?`, msgTbl),
+				guid,
+			).Scan(&existingID, &existingTs)
+			if err == nil && existingTs == now {
+				// Duplicate message: same GUID and same timestamp
+				// Just respond with OK and the existing message info
+				resp, err := buildTLVPayload(func(w io.Writer) error {
+					if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
+						return err
+					}
+					return tlvEncodeI64(w, TAG_MESSAGE_ID, existingID)
+				})
+				if err != nil {
+					_ = cc.writeErr(reqID, "tlv encode error")
+					return
+				}
+				_ = cc.writeOK(reqID, resp)
+				return
+			}
+			// Not a duplicate, it's a real collision - fail the request
+			log.Printf("ERROR: GUID collision detected for chat %d, guid=%d (existing ts=%d, new ts=%d)", chatID, guid, existingTs, now)
+			_ = cc.writeErr(reqID, "guid collision - message with different timestamp already exists")
+			return
 		}
 		// Any other error is terminal
 		log.Printf("ERROR: Failed to insert message into %s: %v (guid=%d, author=%x)", msgTbl, err, guid, cc.pub[:4])
 		_ = cc.writeErr(reqID, fmt.Sprintf("db error - failed to insert message: %v", err))
-		return
-	}
-	if err != nil { // loop exhausted
-		log.Printf("ERROR: guid collision limit exceeded for chat %d", chatID)
-		_ = cc.writeErr(reqID, "db error - guid collision limit exceeded")
 		return
 	}
 
