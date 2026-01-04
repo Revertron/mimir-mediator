@@ -40,6 +40,7 @@ const (
 	TAG_ONLINE      = 0x34 // 1 byte - online status
 	TAG_ACCEPTED    = 0x35 // 1 byte - invite response
 	TAG_LAST_UPDATE = 0x36 // 8 bytes u64 - for incremental sync
+	TAG_LAST_SEEN   = 0x37 // 8 bytes u64 - Unix timestamp in seconds
 )
 
 // TLVField represents a single Type-Length-Value field

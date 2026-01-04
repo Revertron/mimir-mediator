@@ -129,6 +129,7 @@ const (
 	sysChatInfoChange = 0x06
 	sysPermsChanged   = 0x07
 	sysMessageDeleted = 0x08
+	sysMemberOnline   = 0x09 // member online status changed
 
 	maxNameLen       = 25
 	maxDescLen       = 200
@@ -229,6 +230,8 @@ func main() {
 	}
 	// Migrate per-chat users tables to use changed_at instead of last_perm_change
 	migrateUsersChangedAt(db)
+	// Add last_seen column to users tables for online status tracking
+	migrateUsersLastSeen(db)
 
 	cache, err := hybridcache.NewHybridCache("mediator-cache", 512*1024*1024) // 512 MB RAM/disk hybrid
 	if err != nil {
@@ -472,6 +475,24 @@ func migrateUsersChangedAt(db *sql.DB) {
 	}
 }
 
+// migrateUsersLastSeen best-effort migration: add last_seen column to users tables
+func migrateUsersLastSeen(db *sql.DB) {
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'users-%'`)
+	if err != nil {
+		log.Printf("migration: list users tables failed: %v", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		// Add last_seen column if it doesn't exist; ignore error if already exists
+		_, _ = db.Exec(fmt.Sprintf(`ALTER TABLE %q ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0`, name))
+	}
+}
+
 func chatTableNames(id int64) (settings, users, messages string) {
 	settings = fmt.Sprintf("settings-%d", id)
 	users = fmt.Sprintf("users-%d", id)
@@ -560,6 +581,55 @@ func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *
 	return msgID, nil
 }
 
+// broadcastMemberOnlineStatus broadcasts a member online/offline status change event
+// Format: [sysMemberOnline(1)][pubkey(32)][online(1)][timestamp(8)]
+// This is NOT stored in the database, only broadcast to currently online members
+func (s *serverState) broadcastMemberOnlineStatus(chatID int64, memberPubkey [32]byte, isOnline bool, timestamp int64) {
+	online := byte(0)
+	if isOnline {
+		online = 1
+	}
+
+	// Build system message body: [event(1)][pubkey(32)][online(1)][timestamp(8)]
+	body := make([]byte, 42)
+	body[0] = byte(sysMemberOnline)
+	copy(body[1:33], memberPubkey[:])
+	body[33] = online
+	binary.BigEndian.PutUint64(body[34:42], uint64(timestamp))
+
+	guid := generateMessageGuid(timestamp, body)
+
+	// Build TLV broadcast payload for cmdGotMessage
+	broadcastPayload, err := buildTLVPayload(func(w io.Writer) error {
+		if err := tlvEncodeI64(w, TAG_CHAT_ID, chatID); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_MESSAGE_ID, 0); err != nil { // msgID=0 since not stored
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
+			return err
+		}
+		if err := tlvEncodeI64(w, TAG_TIMESTAMP, timestamp); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_PUBKEY, s.pub); err != nil {
+			return err
+		}
+		if err := tlvEncodeBytes(w, TAG_MESSAGE_BLOB, body); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("Failed to encode member online status broadcast: %v", err)
+		return
+	}
+
+	// Broadcast to all online members (exclude the member who's status changed)
+	go s.broadcastToChat(chatID, nil, cmdGotMessage, broadcastPayload)
+}
+
 func createChatTables(tx *sql.Tx, id int64) error {
 	sett, users, msgs := chatTableNames(id)
 	ddl := fmt.Sprintf(`
@@ -578,7 +648,8 @@ CREATE TABLE %q(
   accepted_at INTEGER NOT NULL,
   changed_at INTEGER NOT NULL,
   banned INTEGER NOT NULL DEFAULT 0,
-  info BLOB
+  info BLOB,
+  last_seen INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE %q(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2265,7 +2336,7 @@ func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 	}
 
 	usersTbl := fmt.Sprintf("users-%d", chatID)
-	rows, err := cc.s.db.Query(fmt.Sprintf(`SELECT pubkey, perms_flags FROM %q WHERE banned=0`, usersTbl))
+	rows, err := cc.s.db.Query(fmt.Sprintf(`SELECT pubkey, perms_flags, last_seen FROM %q WHERE banned=0`, usersTbl))
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
 		return
@@ -2273,16 +2344,18 @@ func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 	defer rows.Close()
 
 	type member struct {
-		pubkey [32]byte
-		perms  byte
-		online byte
+		pubkey   [32]byte
+		perms    byte
+		online   byte
+		lastSeen int64
 	}
 	var members []member
 
 	for rows.Next() {
 		var pk []byte
 		var perms int64
-		if err := rows.Scan(&pk, &perms); err != nil {
+		var lastSeen int64
+		if err := rows.Scan(&pk, &perms, &lastSeen); err != nil {
 			continue
 		}
 		if len(pk) != 32 {
@@ -2292,6 +2365,7 @@ func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 		var m member
 		copy(m.pubkey[:], pk)
 		m.perms = byte(perms)
+		m.lastSeen = lastSeen
 
 		// Check online state: look up if this pubkey has any connections subscribed to this chat
 		m.online = 0
@@ -2330,6 +2404,9 @@ func (cc *clientConn) handleGetMembers(reqID uint16, p []byte) {
 				return err
 			}
 			if err := tlvEncodeU8(w, TAG_ONLINE, m.online); err != nil {
+				return err
+			}
+			if err := tlvEncodeU64(w, TAG_LAST_SEEN, uint64(m.lastSeen)); err != nil {
 				return err
 			}
 		}
@@ -2394,11 +2471,20 @@ func (s *serverState) subscribe(chatID int64, cc *clientConn) {
 	}
 	set[cc] = struct{}{}
 	cc.chats[chatID] = struct{}{}
+
+	// Broadcast that this member came online
+	if cc.authed {
+		timestamp := time.Now().Unix()
+		go s.broadcastMemberOnlineStatus(chatID, cc.pub, true, timestamp)
+	}
 }
 
 // Unsubscribe the connection from all chats (called on disconnect)
 func (s *serverState) unsubscribeAll(cc *clientConn) {
+    timestamp := time.Now().Unix()
+
     s.chatMu.Lock()
+    chatsToNotify := make([]int64, 0, len(cc.chats))
     for chatID := range cc.chats {
             if set, ok := s.chatSubscriptions[chatID]; ok {
                     delete(set, cc)
@@ -2406,6 +2492,7 @@ func (s *serverState) unsubscribeAll(cc *clientConn) {
                             delete(s.chatSubscriptions, chatID)
                     }
             }
+            chatsToNotify = append(chatsToNotify, chatID)
     }
     cc.chats = make(map[int64]struct{})
     s.chatMu.Unlock()
@@ -2435,6 +2522,18 @@ func (s *serverState) unsubscribeAll(cc *clientConn) {
             }
 
             s.authClientsMu.Unlock()
+
+            // Update last_seen in database and broadcast offline status for each chat
+            for _, chatID := range chatsToNotify {
+                    usersTbl := fmt.Sprintf("users-%d", chatID)
+                    _, err := s.db.Exec(fmt.Sprintf(`UPDATE %q SET last_seen=? WHERE pubkey=?`, usersTbl), timestamp, cc.pub[:])
+                    if err != nil {
+                            log.Printf("Failed to update last_seen for user %x in chat %d: %v", cc.pub[:4], chatID, err)
+                    }
+
+                    // Broadcast that this member went offline
+                    go s.broadcastMemberOnlineStatus(chatID, cc.pub, false, timestamp)
+            }
     }
 }
 
