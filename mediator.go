@@ -1745,12 +1745,18 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 	msgTbl := fmt.Sprintf("messages-%d", chatID)
 	now := time.Now().Unix()
 
-	// Try to insert the message
-	res, err := cc.s.db.Exec(
-		fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
-		now, guid, cc.pub[:],
-	)
-	if err != nil {
+	// Retry loop for GUID collisions
+	const maxRetries = 10
+	var res sql.Result
+	originalGuid := guid
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		res, err = cc.s.db.Exec(
+			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
+			now, guid, cc.pub[:],
+		)
+		if err == nil {
+			break // success
+		}
 		// If it's a UNIQUE-constraint failure on guid, check if it's a duplicate
 		if strings.Contains(err.Error(), "constraint failed: UNIQUE constraint failed") {
 			// Get the existing message with this GUID (both ID and timestamp in one query)
@@ -1776,14 +1782,19 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 				_ = cc.writeOK(reqID, resp)
 				return
 			}
-			// Not a duplicate, it's a real collision - fail the request
-			log.Printf("ERROR: GUID collision detected for chat %d, guid=%d (existing ts=%d, new ts=%d)", chatID, guid, existingTs, now)
-			_ = cc.writeErr(reqID, "guid collision - message with different timestamp already exists")
-			return
+			// Real collision with different timestamp - increment GUID and retry
+			log.Printf("GUID collision for chat %d, guid=%d (existing ts=%d, new ts=%d) - incrementing and retrying", chatID, guid, existingTs, now)
+			guid++
+			continue
 		}
 		// Any other error is terminal
 		log.Printf("ERROR: Failed to insert message into %s: %v (guid=%d, author=%x)", msgTbl, err, guid, cc.pub[:4])
 		_ = cc.writeErr(reqID, fmt.Sprintf("db error - failed to insert message: %v", err))
+		return
+	}
+	if err != nil { // loop exhausted
+		log.Printf("ERROR: GUID collision limit exceeded for chat %d (original guid=%d)", chatID, originalGuid)
+		_ = cc.writeErr(reqID, "db error - guid collision limit exceeded")
 		return
 	}
 
