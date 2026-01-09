@@ -1737,6 +1737,12 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 		blob = []byte{} // Empty message allowed
 	}
 
+	// Try to get timestamp from client, otherwise use server time
+	timestamp, err := tlvGetI64(tlvs, TAG_TIMESTAMP)
+	if err != nil {
+		timestamp = time.Now().Unix()
+	}
+
 	role, banned, ok := cc.lookupPerms(chatID, cc.pub[:])
 	if !ok || banned {
 		_ = cc.writeErr(reqID, "not a member or banned")
@@ -1749,7 +1755,6 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 	}
 
 	msgTbl := fmt.Sprintf("messages-%d", chatID)
-	now := time.Now().Unix()
 
 	// Retry loop for GUID collisions
 	const maxRetries = 10
@@ -1758,7 +1763,7 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		res, err = cc.s.db.Exec(
 			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
-			now, guid, cc.pub[:],
+			timestamp, guid, cc.pub[:],
 		)
 		if err == nil {
 			break // success
@@ -1772,7 +1777,7 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 				fmt.Sprintf(`SELECT id, ts FROM %q WHERE guid=?`, msgTbl),
 				guid,
 			).Scan(&existingID, &existingTs)
-			if err == nil && existingTs == now {
+			if err == nil && existingTs == timestamp {
 				// Duplicate message: same GUID and same timestamp
 				// Just respond with OK and the existing message info
 				resp, err := buildTLVPayload(func(w io.Writer) error {
@@ -1789,7 +1794,7 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 				return
 			}
 			// Real collision with different timestamp - increment GUID and retry
-			log.Printf("GUID collision for chat %d, guid=%d (existing ts=%d, new ts=%d) - incrementing and retrying", chatID, guid, existingTs, now)
+			log.Printf("GUID collision for chat %d, guid=%d (existing ts=%d, new ts=%d) - incrementing and retrying", chatID, guid, existingTs, timestamp)
 			guid++
 			continue
 		}
@@ -1823,7 +1828,7 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 		if err := tlvEncodeI64(w, TAG_MESSAGE_GUID, guid); err != nil {
 			return err
 		}
-		if err := tlvEncodeI64(w, TAG_TIMESTAMP, now); err != nil {
+		if err := tlvEncodeI64(w, TAG_TIMESTAMP, timestamp); err != nil {
 			return err
 		}
 		if err := tlvEncodeBytes(w, TAG_PUBKEY, cc.pub[:]); err != nil {
