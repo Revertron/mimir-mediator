@@ -88,6 +88,7 @@ const (
 	cmdPing               = 0x03
 	cmdCreateChat         = 0x10
 	cmdDeleteChat         = 0x11
+	cmdUpdateChatInfo     = 0x12 // Update chat name/description/avatar (owner/admin only)
 	cmdAddUser            = 0x20
 	cmdDeleteUser         = 0x21
 	cmdLeaveChat          = 0x22
@@ -352,6 +353,8 @@ func (s *serverState) serveClient(ctx context.Context, c *yggquic.Conn) {
 			cc.handleCreateChat(reqId, payload)
 		case cmdDeleteChat:
 			cc.handleDeleteChat(reqId, payload)
+		case cmdUpdateChatInfo:
+			cc.handleUpdateChatInfo(reqId, payload)
 		case cmdAddUser:
 			cc.handleAddUser(reqId, payload)
 		case cmdDeleteUser:
@@ -1166,6 +1169,146 @@ func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
 
 	// return OK: 1 byte (1)
 	_ = cc.writeOK(reqID, []byte{1})
+}
+
+// handleUpdateChatInfo updates chat settings (name, description, avatar)
+// Only owner or admin can update chat info
+// Request TLV: chat_id (required), name (optional), desc (optional), avatar (optional)
+// At least one of name/desc/avatar must be provided
+// System message format: [sysChatInfoChange(1)][TLV: actor pubkey, changed fields]
+func (cc *clientConn) handleUpdateChatInfo(reqID uint16, p []byte) {
+	if !cc.authed {
+		_ = cc.writeErr(reqID, "auth required")
+		return
+	}
+
+	// Parse TLV payload
+	tlvs, err := parseTLVs(p)
+	if err != nil {
+		_ = cc.writeErr(reqID, "bad tlv payload")
+		return
+	}
+
+	chatID, err := tlvGetI64(tlvs, TAG_CHAT_ID)
+	if err != nil {
+		_ = cc.writeErr(reqID, "missing or invalid chat id")
+		return
+	}
+
+	// Extract optional fields
+	name, hasName := tlvs[TAG_CHAT_NAME]
+	desc, hasDesc := tlvs[TAG_CHAT_DESC]
+	avatar, hasAvatar := tlvs[TAG_CHAT_AVATAR]
+
+	// At least one field must be provided
+	if !hasName && !hasDesc && !hasAvatar {
+		_ = cc.writeErr(reqID, "no fields to update")
+		return
+	}
+
+	// Validate field sizes
+	if hasName && utf8.RuneCountInString(string(name)) > maxNameLen {
+		_ = cc.writeErr(reqID, "name too long")
+		return
+	}
+	if hasDesc && utf8.RuneCountInString(string(desc)) > maxDescLen {
+		_ = cc.writeErr(reqID, "description too long")
+		return
+	}
+	if hasAvatar && len(avatar) > maxAvatarBytes {
+		_ = cc.writeErr(reqID, "avatar too large")
+		return
+	}
+
+	// Check caller permissions
+	callerRole, callerBanned, ok := cc.lookupPerms(chatID, cc.pub[:])
+	if !ok {
+		_ = cc.writeErr(reqID, "not a member")
+		return
+	}
+	if callerBanned {
+		_ = cc.writeErr(reqID, "banned")
+		return
+	}
+
+	// Only owner or admin can update chat info
+	isOwner := (callerRole & permOwner) != 0
+	isAdmin := (callerRole & permAdmin) != 0
+	if !isOwner && !isAdmin {
+		_ = cc.writeErr(reqID, "insufficient perms")
+		return
+	}
+
+	// Build dynamic UPDATE query
+	settTbl := fmt.Sprintf("settings-%d", chatID)
+	var setClauses []string
+	var args []interface{}
+
+	if hasName {
+		setClauses = append(setClauses, "name=?")
+		args = append(args, string(name))
+	}
+	if hasDesc {
+		setClauses = append(setClauses, "description=?")
+		args = append(args, string(desc))
+	}
+	if hasAvatar {
+		setClauses = append(setClauses, "avatar=?")
+		args = append(args, avatar)
+	}
+
+	query := fmt.Sprintf(`UPDATE %q SET %s`, settTbl, strings.Join(setClauses, ", "))
+	_, err = cc.s.db.Exec(query, args...)
+	if err != nil {
+		log.Printf("ERROR updating chat info for chat %d: %v", chatID, err)
+		_ = cc.writeErr(reqID, "db error")
+		return
+	}
+
+	// Build system message body: [sysChatInfoChange(1)][TLV: actor pubkey, changed fields]
+	now := time.Now().Unix()
+
+	sysBody, err := buildTLVPayload(func(w io.Writer) error {
+		// Write event code
+		if _, err := w.Write([]byte{sysChatInfoChange}); err != nil {
+			return err
+		}
+		// Write actor pubkey as TLV
+		if err := tlvEncodeBytes(w, TAG_PUBKEY, cc.pub[:]); err != nil {
+			return err
+		}
+		// Write changed fields as TLV
+		if hasName {
+			if err := tlvEncodeBytes(w, TAG_CHAT_NAME, name); err != nil {
+				return err
+			}
+		}
+		if hasDesc {
+			if err := tlvEncodeBytes(w, TAG_CHAT_DESC, desc); err != nil {
+				return err
+			}
+		}
+		if hasAvatar {
+			if err := tlvEncodeBytes(w, TAG_CHAT_AVATAR, avatar); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("ERROR encoding chat info change system message: %v", err)
+		_ = cc.writeErr(reqID, "encode error")
+		return
+	}
+
+	// Broadcast system message (nil sender so actor receives it too)
+	if _, err := cc.s.broadcastSystemMessage(chatID, sysBody, nil, now, true); err != nil {
+		log.Printf("ERROR broadcasting chat info change: %v", err)
+		_ = cc.writeErr(reqID, "broadcast error")
+		return
+	}
+
+	_ = cc.writeOK(reqID, nil)
 }
 
 func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
