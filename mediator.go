@@ -241,6 +241,8 @@ func main() {
 	migrateUsersChangedAt(db)
 	// Add last_seen column to users tables for online status tracking
 	migrateUsersLastSeen(db)
+	// Remove CHECK constraints from settings tables (validation done in handlers)
+	migrateSettingsRemoveCheckConstraints(db)
 
 	cache, err := hybridcache.NewHybridCache("mediator-cache", 512*1024*1024) // 512 MB RAM/disk hybrid
 	if err != nil {
@@ -504,6 +506,88 @@ func migrateUsersLastSeen(db *sql.DB) {
 	}
 }
 
+// migrateSettingsRemoveCheckConstraints removes CHECK constraints from settings tables.
+// Validation is handled in handler code, so DB constraints are unnecessary.
+func migrateSettingsRemoveCheckConstraints(db *sql.DB) {
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'settings-%'`)
+	if err != nil {
+		log.Printf("migration: list settings tables failed: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		tables = append(tables, name)
+	}
+	rows.Close()
+
+	for _, tbl := range tables {
+		// Check if table has CHECK constraints
+		var createSQL string
+		err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, tbl).Scan(&createSQL)
+		if err != nil {
+			continue
+		}
+		if !strings.Contains(createSQL, "CHECK") {
+			continue // no constraints to remove
+		}
+
+		log.Printf("migration: removing CHECK constraints from %s", tbl)
+
+		tx, err := db.Begin()
+		if err != nil {
+			log.Printf("migration: begin tx for %s failed: %v", tbl, err)
+			continue
+		}
+
+		tempTbl := tbl + "_new"
+		newSchema := fmt.Sprintf(`
+			CREATE TABLE %q(
+				name TEXT NOT NULL,
+				description TEXT NOT NULL,
+				avatar BLOB,
+				perms_flags INTEGER NOT NULL,
+				created_at INTEGER NOT NULL,
+				extra TEXT
+			)`, tempTbl)
+
+		if _, err := tx.Exec(newSchema); err != nil {
+			log.Printf("migration: create temp table for %s failed: %v", tbl, err)
+			_ = tx.Rollback()
+			continue
+		}
+
+		copySQL := fmt.Sprintf(`INSERT INTO %q SELECT name, description, avatar, perms_flags, created_at, extra FROM %q`, tempTbl, tbl)
+		if _, err := tx.Exec(copySQL); err != nil {
+			log.Printf("migration: copy data for %s failed: %v", tbl, err)
+			_ = tx.Rollback()
+			continue
+		}
+
+		if _, err := tx.Exec(fmt.Sprintf(`DROP TABLE %q`, tbl)); err != nil {
+			log.Printf("migration: drop old %s failed: %v", tbl, err)
+			_ = tx.Rollback()
+			continue
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE %q RENAME TO %q`, tempTbl, tbl)); err != nil {
+			log.Printf("migration: rename %s failed: %v", tempTbl, err)
+			_ = tx.Rollback()
+			continue
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("migration: commit for %s failed: %v", tbl, err)
+			continue
+		}
+		log.Printf("migration: removed CHECK constraints from %s", tbl)
+	}
+}
+
 func chatTableNames(id int64) (settings, users, messages string) {
 	settings = fmt.Sprintf("settings-%d", id)
 	users = fmt.Sprintf("users-%d", id)
@@ -647,8 +731,8 @@ func createChatTables(tx *sql.Tx, id int64) error {
 	sett, users, msgs := chatTableNames(id)
 	ddl := fmt.Sprintf(`
 CREATE TABLE %q(
-  name TEXT NOT NULL CHECK(length(name) <= %d),
-  description TEXT NOT NULL CHECK(length(description) <= %d),
+  name TEXT NOT NULL,
+  description TEXT NOT NULL,
   avatar BLOB,
   perms_flags INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
@@ -670,7 +754,7 @@ CREATE TABLE %q(
   guid INTEGER NOT NULL UNIQUE,
   author BLOB(32) NOT NULL
 );
-`, sett, maxNameLen, maxDescLen, users, msgs)
+`, sett, users, msgs)
 	_, err := tx.Exec(ddl)
 	return err
 }
