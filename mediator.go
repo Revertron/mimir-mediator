@@ -143,6 +143,7 @@ const (
 
 type serverState struct {
 	db        *sql.DB
+	dbWriteMu sync.Mutex // serializes all database write operations to prevent SQLITE_BUSY
 	node      *core.Core
 	transport *yggquic.YggdrasilTransport
 	priv      ed25519.PrivateKey
@@ -534,10 +535,12 @@ func (s *serverState) broadcastSystemMessage(chatID int64, body []byte, sender *
 	if storeInDB {
 		// Insert into messages table
 		msgTbl := fmt.Sprintf("messages-%d", chatID)
+		s.dbWriteMu.Lock()
 		res, err := s.db.Exec(
 			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
 			timestamp, guid, s.pub,
 		)
+		s.dbWriteMu.Unlock()
 		if err != nil {
 			return 0, fmt.Errorf("failed to insert system message: %w", err)
 		}
@@ -796,12 +799,15 @@ func (cc *clientConn) handleGetNonce(reqID uint16, p []byte) {
 	}
 	now := time.Now().Unix()
 
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(`INSERT INTO nonces(pubkey, nonce, ts)
 		VALUES(?,?,?)
 		ON CONFLICT(pubkey) DO UPDATE SET nonce=excluded.nonce, ts=excluded.ts`,
 		pk, nonce[:], now)
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
-		_ = cc.writeErr(reqID, "db error")
+		log.Printf("[DEBUG] handleGetNonce: db error inserting nonce: %v", err)
+		_ = cc.writeErr(reqID, "db error inserting nonce")
 		return
 	}
 
@@ -861,7 +867,10 @@ func (cc *clientConn) handleAuth(reqID uint16, p []byte) {
 	}
 
 	// Delete used nonce to prevent replay and allow new nonces for other operations
-	if _, err := cc.s.db.Exec(`DELETE FROM nonces WHERE pubkey=?`, pk[:]); err != nil {
+	cc.s.dbWriteMu.Lock()
+	_, err = cc.s.db.Exec(`DELETE FROM nonces WHERE pubkey=?`, pk[:])
+	cc.s.dbWriteMu.Unlock()
+	if err != nil {
 		log.Printf("Warning: failed to delete auth nonce for %x: %v", pk[:4], err)
 	}
 	log.Printf("[DEBUG] user %x authenticated", pk[:4])
@@ -996,7 +1005,10 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 	}
 
 	// Delete used nonce to prevent replay
-	if _, err := cc.s.db.Exec(`DELETE FROM nonces WHERE pubkey=?`, owner[:]); err != nil {
+	cc.s.dbWriteMu.Lock()
+	_, err = cc.s.db.Exec(`DELETE FROM nonces WHERE pubkey=?`, owner[:])
+	cc.s.dbWriteMu.Unlock()
+	if err != nil {
 		log.Printf("Warning: failed to delete nonce for %x: %v", owner[:4], err)
 		// Don't fail the request, just log warning
 	}
@@ -1012,13 +1024,16 @@ func (cc *clientConn) handleCreateChat(reqID uint16, p []byte) {
 		chatID = 1 // avoid 0
 	}
 
+	cc.s.dbWriteMu.Lock()
 	tx, err := cc.s.db.Begin()
 	if err != nil {
+		cc.s.dbWriteMu.Unlock()
 		_ = cc.writeErr(reqID, "db begin")
 		return
 	}
 	defer func() {
 		_ = tx.Rollback()
+		cc.s.dbWriteMu.Unlock()
 	}()
 
 	// global chats row
@@ -1093,12 +1108,17 @@ func (cc *clientConn) handleDeleteChat(reqID uint16, p []byte) {
 		return
 	}
 
+	cc.s.dbWriteMu.Lock()
 	tx, err := cc.s.db.Begin()
 	if err != nil {
+		cc.s.dbWriteMu.Unlock()
 		_ = cc.writeErr(reqID, "db begin")
 		return
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		_ = tx.Rollback()
+		cc.s.dbWriteMu.Unlock()
+	}()
 
 	sett, users, msgs := chatTableNames(chatID)
 	stmts := []string{
@@ -1258,7 +1278,9 @@ func (cc *clientConn) handleUpdateChatInfo(reqID uint16, p []byte) {
 	}
 
 	query := fmt.Sprintf(`UPDATE %q SET %s`, settTbl, strings.Join(setClauses, ", "))
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(query, args...)
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
 		log.Printf("ERROR updating chat info for chat %d: %v", chatID, err)
 		_ = cc.writeErr(reqID, "db error")
@@ -1348,10 +1370,12 @@ func (cc *clientConn) handleAddUser(reqID uint16, p []byte) {
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	now := time.Now().Unix()
 
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info)
         VALUES(?,?,?,?,?,0,?)
         ON CONFLICT(pubkey) DO UPDATE SET banned=0, perms_flags=excluded.perms_flags`, usersTbl),
 		newUser, "", permUser, now, now, nil)
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
 		return
@@ -1409,10 +1433,12 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	now := time.Now().Unix()
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(fmt.Sprintf(`UPDATE %q SET banned=1, perms_flags=(perms_flags | ?), changed_at=? WHERE pubkey=?`, usersTbl),
 		permBanned, now, userPK)
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
-		_ = cc.writeErr(reqID, "db error")
+		_ = cc.writeErr(reqID, "db error deleting user")
 		return
 	}
 	// System message: user banned by cc.pub (include 32-byte random tail)
@@ -1425,7 +1451,7 @@ func (cc *clientConn) handleDeleteUser(reqID uint16, p []byte) {
 
 	if _, err := cc.s.broadcastSystemMessage(chatID, body, cc, now, true); err != nil {
 		log.Printf("ERROR: %v", err)
-		_ = cc.writeErr(reqID, "db error")
+		_ = cc.writeErr(reqID, "db error deleting user")
 		return
 	}
 
@@ -1516,8 +1542,10 @@ func (cc *clientConn) handleChangeMemberStatus(reqID uint16, p []byte) {
 		banned = 1
 	}
 
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(fmt.Sprintf(`UPDATE %q SET perms_flags=?, banned=?, changed_at=? WHERE pubkey=?`, usersTbl),
 		newPerms, banned, now, targetUserPK)
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
 		log.Printf("ERROR updating member permissions: %v", err)
 		_ = cc.writeErr(reqID, "db error")
@@ -1670,7 +1698,9 @@ func (cc *clientConn) handleLeaveChat(reqID uint16, p []byte) {
 	}
 
 	usersTbl := fmt.Sprintf("users-%d", chatID)
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(fmt.Sprintf(`DELETE FROM %q WHERE pubkey=?`, usersTbl), cc.pub[:])
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
 		_ = cc.writeErr(reqID, "db error")
 		return
@@ -1904,10 +1934,12 @@ func (cc *clientConn) handleSendMessage(reqID uint16, p []byte) {
 	var res sql.Result
 	originalGuid := guid
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		cc.s.dbWriteMu.Lock()
 		res, err = cc.s.db.Exec(
 			fmt.Sprintf(`INSERT INTO %q(ts, guid, author) VALUES(?,?,?)`, msgTbl),
 			timestamp, guid, cc.pub[:],
 		)
+		cc.s.dbWriteMu.Unlock()
 		if err == nil {
 			break // success
 		}
@@ -2049,7 +2081,9 @@ func (cc *clientConn) handleDeleteMessage(reqID uint16, p []byte) {
 		}
 	}
 
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(fmt.Sprintf(`DELETE FROM %q WHERE guid=?`, msgTbl), guid)
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
 		_ = cc.writeErr(reqID, fmt.Sprintf("db error: %v", err))
 		return
@@ -2171,8 +2205,10 @@ func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
 
 	// Insert invite into database
 	now := time.Now().Unix()
+	cc.s.dbWriteMu.Lock()
 	result, err := cc.s.db.Exec(`INSERT INTO invites(timestamp, from_pubkey, to_pubkey, chat_id, encrypted_data) VALUES(?,?,?,?,?)`,
 		now, cc.pub[:], toPubkey, chatID, encryptedData)
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
 		_ = cc.writeErr(reqID, "db insert error")
 		return
@@ -2259,10 +2295,12 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 		now := time.Now().Unix()
 
 		// Add user to members table with user permissions
+		cc.s.dbWriteMu.Lock()
 		_, err = cc.s.db.Exec(fmt.Sprintf(`INSERT INTO %q(pubkey, text_rank, perms_flags, accepted_at, changed_at, banned, info)
             VALUES(?,?,?,?,?,0,?)
             ON CONFLICT(pubkey) DO UPDATE SET banned=0, perms_flags=excluded.perms_flags`, usersTbl),
 			cc.pub[:], "", permUser, now, 0, nil)
+		cc.s.dbWriteMu.Unlock()
 		if err != nil {
 			log.Printf("Failed to add user to chat %d: %v", chatID, err)
 			_ = cc.writeErr(reqID, "db error")
@@ -2284,7 +2322,9 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 		}
 
 		// Delete the invite
+		cc.s.dbWriteMu.Lock()
 		_, err = cc.s.db.Exec(`DELETE FROM invites WHERE id=?`, inviteID)
+		cc.s.dbWriteMu.Unlock()
 		if err != nil {
 			log.Printf("Failed to delete invite %d: %v", inviteID, err)
 			_ = cc.writeErr(reqID, "db error")
@@ -2297,7 +2337,9 @@ func (cc *clientConn) handleInviteResponse(reqID uint16, p []byte) {
 		// User rejected: just delete the invite
 		log.Printf("Invite %d rejected by %x", inviteID, cc.pub[:4])
 
+		cc.s.dbWriteMu.Lock()
 		_, err = cc.s.db.Exec(`DELETE FROM invites WHERE id=?`, inviteID)
+		cc.s.dbWriteMu.Unlock()
 		if err != nil {
 			log.Printf("Failed to delete invite %d: %v", inviteID, err)
 			_ = cc.writeErr(reqID, "db error")
@@ -2348,7 +2390,9 @@ func (cc *clientConn) handleUpdateMemberInfo(reqID uint16, p []byte) {
 	// Store encrypted member info in users table and bump changed_at
 	usersTbl := fmt.Sprintf("users-%d", chatID)
 	query := fmt.Sprintf(`UPDATE %q SET info=?, changed_at=? WHERE pubkey=?`, usersTbl)
+	cc.s.dbWriteMu.Lock()
 	_, err = cc.s.db.Exec(query, encryptedBlob, timestamp, cc.pub[:])
+	cc.s.dbWriteMu.Unlock()
 	if err != nil {
 		log.Printf("Failed to update member info for %x in chat %d: %v", cc.pub[:4], chatID, err)
 		_ = cc.writeErr(reqID, "db error")
@@ -2706,7 +2750,9 @@ func (s *serverState) unsubscribeAll(cc *clientConn) {
 		// Update last_seen in database and broadcast offline status for each chat
 		for _, chatID := range chatsToNotify {
 			usersTbl := fmt.Sprintf("users-%d", chatID)
+			s.dbWriteMu.Lock()
 			_, err := s.db.Exec(fmt.Sprintf(`UPDATE %q SET last_seen=? WHERE pubkey=?`, usersTbl), timestamp, cc.pub[:])
+			s.dbWriteMu.Unlock()
 			if err != nil {
 				log.Printf("Failed to update last_seen for user %x in chat %d: %v", cc.pub[:4], chatID, err)
 			}
@@ -2833,7 +2879,10 @@ func (s *serverState) sendInviteToClient(cc *clientConn, inviteID int64, timesta
 	}
 
 	// Mark invite as sent (best-effort)
-	if _, err := s.db.Exec(`UPDATE invites SET sent=1 WHERE id=?`, inviteID); err != nil {
+	s.dbWriteMu.Lock()
+	_, err = s.db.Exec(`UPDATE invites SET sent=1 WHERE id=?`, inviteID)
+	s.dbWriteMu.Unlock()
+	if err != nil {
 		log.Printf("Warning: failed to mark invite %d as sent: %v", inviteID, err)
 	}
 
@@ -2905,7 +2954,9 @@ func (s *serverState) cleanupOldInvites() {
 	now := time.Now().Unix()
 	cutoff := now - threeDaysSeconds
 
+	s.dbWriteMu.Lock()
 	result, err := s.db.Exec(`DELETE FROM invites WHERE timestamp < ?`, cutoff)
+	s.dbWriteMu.Unlock()
 	if err != nil {
 		log.Printf("Failed to clean up old invites: %v", err)
 		return
