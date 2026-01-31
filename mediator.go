@@ -225,7 +225,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;`); err != nil {
+	if _, err := db.Exec(`
+		PRAGMA journal_mode=WAL;
+		PRAGMA foreign_keys=ON;
+		PRAGMA busy_timeout=5000;
+		PRAGMA synchronous=NORMAL;
+		PRAGMA cache_size=-262144;
+	`); err != nil {
 		log.Fatal(err)
 	}
 	if err := initGlobalSchema(db); err != nil {
