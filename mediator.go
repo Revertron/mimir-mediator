@@ -2287,32 +2287,49 @@ func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
 	}
 
 	// Check if invite already exists
+	now := time.Now().Unix()
+	const oneHourSeconds int64 = 60 * 60
+
 	var existingID int64
-	err = cc.s.db.QueryRow(`SELECT id FROM invites WHERE to_pubkey=? AND chat_id=?`,
-		toPubkey, chatID).Scan(&existingID)
-	if err == nil {
-		// Invite already exists
-		_ = cc.writeErr(reqID, "invite already exists")
-		return
-	}
+	var existingTimestamp int64
+	err = cc.s.db.QueryRow(`SELECT id, timestamp FROM invites WHERE to_pubkey=? AND chat_id=?`,
+		toPubkey, chatID).Scan(&existingID, &existingTimestamp)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		_ = cc.writeErr(reqID, "db error")
 		return
 	}
 
-	// Insert invite into database
-	now := time.Now().Unix()
-	cc.s.dbWriteMu.Lock()
-	result, err := cc.s.db.Exec(`INSERT INTO invites(timestamp, from_pubkey, to_pubkey, chat_id, encrypted_data) VALUES(?,?,?,?,?)`,
-		now, cc.pub[:], toPubkey, chatID, encryptedData)
-	cc.s.dbWriteMu.Unlock()
-	if err != nil {
-		_ = cc.writeErr(reqID, "db insert error")
-		return
+	var inviteID int64
+	if err == nil {
+		// Invite already exists - check if it's old enough to allow re-sending
+		if now-existingTimestamp < oneHourSeconds {
+			_ = cc.writeErr(reqID, "invite already exists")
+			return
+		}
+		// Invite is older than 1 hour, update it for re-delivery
+		cc.s.dbWriteMu.Lock()
+		_, err = cc.s.db.Exec(`UPDATE invites SET timestamp=?, from_pubkey=?, encrypted_data=?, sent=0 WHERE id=?`,
+			now, cc.pub[:], encryptedData, existingID)
+		cc.s.dbWriteMu.Unlock()
+		if err != nil {
+			_ = cc.writeErr(reqID, "db update error")
+			return
+		}
+		inviteID = existingID
+		log.Printf("Invite refreshed: from %x… to %x… for chat %d (id=%d)", cc.pub[:4], toPubkey[:4], chatID, inviteID)
+	} else {
+		// No existing invite, insert new one
+		cc.s.dbWriteMu.Lock()
+		result, err := cc.s.db.Exec(`INSERT INTO invites(timestamp, from_pubkey, to_pubkey, chat_id, encrypted_data) VALUES(?,?,?,?,?)`,
+			now, cc.pub[:], toPubkey, chatID, encryptedData)
+		cc.s.dbWriteMu.Unlock()
+		if err != nil {
+			_ = cc.writeErr(reqID, "db insert error")
+			return
+		}
+		inviteID, _ = result.LastInsertId()
+		log.Printf("Invite created: from %x… to %x… for chat %d (id=%d)", cc.pub[:4], toPubkey[:4], chatID, inviteID)
 	}
-
-	inviteID, _ := result.LastInsertId()
-	log.Printf("Invite created: from %x… to %x… for chat %d (id=%d)", cc.pub[:4], toPubkey[:4], chatID, inviteID)
 
 	// Check if recipient is currently connected and authenticated (multi-device support)
 	var toPubArr [32]byte
