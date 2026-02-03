@@ -2279,6 +2279,13 @@ func (cc *clientConn) handleSendInvite(reqID uint16, p []byte) {
 		return
 	}
 
+	// Check if target user is already a member of the chat
+	targetRole, targetBanned, targetExists := cc.lookupPerms(chatID, toPubkey)
+	if targetExists && !targetBanned && hasAny(targetRole, permOwner|permAdmin|permMod|permUser|permReadOnly) {
+		_ = cc.writeErr(reqID, "user already in chat")
+		return
+	}
+
 	// Check if invite already exists
 	var existingID int64
 	err = cc.s.db.QueryRow(`SELECT id FROM invites WHERE to_pubkey=? AND chat_id=?`,
